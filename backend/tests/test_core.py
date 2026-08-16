@@ -1,5 +1,8 @@
 import math
+import pytest
 from fastapi.testclient import TestClient
+from app.config import Settings
+import app.main as main_module
 from app.indicators import sma,ema,rsi,macd,atr,bollinger,rolling_volatility,rate_of_change,support_resistance
 from app.scoring import score,MARKET_WEIGHTS,STOCK_WEIGHTS
 from app.schemas import RiskRequest,AIAnalysis
@@ -51,3 +54,22 @@ def test_settings_validation_and_paper_order_confirmation_gate():
         assert preview.status_code == 200 and preview.json()["risk"]["decision"] == "APPROVED"
         submission = client.post("/api/trading/orders", json=order)
         assert submission.status_code == 409
+
+
+def test_production_requires_explicit_https_cors_and_disables_remote_paper_orders(monkeypatch):
+    monkeypatch.setenv("MARKETMIND_ENV", "production")
+    monkeypatch.setenv("CORS_ORIGINS", "https://marketmind.example")
+    monkeypatch.setenv("FRONTEND_ORIGIN", "https://marketmind.example")
+    production = Settings(_env_file=None)
+    assert production.cors_origin_list == ["https://marketmind.example"]
+    assert not production.paper_order_submission_enabled
+    monkeypatch.setattr(main_module, "settings", production)
+    with TestClient(main_module.app) as client:
+        blocked = client.post("/api/trading/orders", json={"symbol":"NVDA","quantity":1,"side":"BUY","order_type":"limit","limit_price":100,"estimated_price":100,"confirmed":True})
+        assert blocked.status_code == 403
+    monkeypatch.setenv("ENABLE_REMOTE_PAPER_ORDERS", "true")
+    enabled = Settings(_env_file=None)
+    assert enabled.paper_order_submission_enabled
+    monkeypatch.setenv("CORS_ORIGINS", "*")
+    with pytest.raises(ValueError):
+        Settings(_env_file=None)

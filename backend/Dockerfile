@@ -8,4 +8,4 @@ COPY alembic.ini .
 RUN useradd -m marketmind && chown -R marketmind /app
 USER marketmind
 EXPOSE 8000
-CMD ["sh","-c","alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+CMD ["sh","-c","alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]

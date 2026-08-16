@@ -1,242 +1,128 @@
 # MarketMind
 
-**AI Market Intelligence Terminal** is a local-first, responsive US-equity workstation. It combines deterministic market calculations, explainable scores, structured AI interpretation, provider adapters, and a risk engine that has final authority over every proposed order.
+**AI Market Intelligence Terminal** is a responsive, installable personal US-equity research workstation. It combines deterministic scores, technical analysis, market scanning, provider adapters, AI interpretation, portfolio analysis, backtesting, and a risk-controlled paper-trading workflow.
 
 > Data calculates. Rules classify. AI interprets. Risk controls.
 
-MarketMind is research and paper-trading software, not investment advice. Scenarios, scores, and backtests do not guarantee an outcome.
+MarketMind is research software, not investment advice. It does not promise results or autonomous real-money trading.
 
 ## What is included
 
-- A dark quantitative command center with a market regime score, index tape, universe breadth, sector leadership, watchlist ranking, and structured market brief.
-- A scanner and individual stock workspace with local technical indicators, explainable stock scores, scenario outlooks, fundamentals, SEC filings, and linked intelligence.
-- Real provider boundaries for Alpaca stocks, Alpaca news, Alpaca options chains, Alpaca paper brokerage, SEC EDGAR, and OpenAI Responses. Every provider has an explicit demo fallback.
-- Deterministic SMA, EMA, RSI, MACD, ATR, Bollinger Bands, rolling volatility, rate of change, support/resistance, moving-average alignment, and volume-spike calculations.
-- A next-session score backtester with transaction costs, CAGR, Sharpe, Sortino, drawdown, trade history, monthly returns, and benchmark comparison.
-- A paper-only execution desk with a mandatory risk preview and a separate confirmation before an Alpaca paper order can be sent.
-- Persisted settings and predictions, including prediction evaluation once an outlook reaches its horizon.
-- Desktop, iPad, and phone layouts, a command palette (Ctrl or Command + K), PWA manifest, and kiosk mode.
+- Dashboard, markets, scanner, stock intelligence, news, options, predictions, backtesting, portfolio, paper trading, and settings.
+- FastAPI provider boundaries with explicit Alpaca, OpenAI, SEC EDGAR, options, and broker fallbacks.
+- A clearly labelled zero-credential demo mode that works locally and in the cloud.
+- Installable PWA metadata, self-hosted app icons, Apple metadata, offline application shell, update prompt, and standalone launch screen.
+- Desktop, tablet, and phone layouts with a bottom navigation and iPhone safe-area support.
+- Docker Compose, SQLite local fallback, PostgreSQL production support, Alembic migrations, health diagnostics, and validation scripts.
 
-## Architecture
+## Install MarketMind on Windows
 
-~~~text
-Browser: Next.js 15 + React 19 + TypeScript + Recharts
-                         |
-                     /api rewrite
-                         |
-FastAPI + Pydantic + deterministic engines + provider adapters
-                         |
-     SQLite for local development / PostgreSQL 16 in Docker Compose
-~~~
+After you deploy MarketMind, open its HTTPS URL in Microsoft Edge or Chrome.
 
-Secrets remain in the FastAPI environment. No browser variable contains an API key.
+1. Open the browser menu or address-bar install button and choose **Install MarketMind** / **Install app**.
+2. Confirm the installation. MarketMind opens in its own application window.
+3. Find **MarketMind** in the Windows Start Menu.
+4. Right-click it and choose **Pin to taskbar** if desired.
+5. If a desktop icon was not created, open the Start Menu, right-click MarketMind, choose **Open file location**, then create a shortcut from that location.
 
-## FIRST RUN ON YOUR COMPUTER
+After installation, launch MarketMind from the icon instead of typing its URL. The installed app receives updated web assets when you accept the in-app refresh prompt.
 
-No provider keys are required. With an unchanged .env file, MarketMind starts in clearly labeled demo mode and every major screen remains usable.
+## Install MarketMind on iPhone
 
-### Windows with Docker Desktop
+An iPhone must use the deployed **HTTPS** URL in Safari. Local HTTP addresses do not provide the complete install experience.
 
-1. Install and start Docker Desktop. Make sure Docker Desktop shows that the engine is running.
-2. Open PowerShell in the MarketMind folder.
-3. Create your local configuration:
+1. Open the MarketMind URL in **Safari**.
+2. Tap **Share**.
+3. Choose **Add to Home Screen**.
+4. If iOS offers **Open as Web App**, leave it enabled.
+5. Tap **Add** and launch MarketMind from the Home Screen.
 
-~~~powershell
-Copy-Item .env.example .env
-~~~
+The manifest, Apple touch icon, standalone display mode, safe-area CSS, and startup screen are included in this repository. Launching from the Home Screen opens the app without normal Safari chrome.
 
-4. Build and start the complete application:
+## Local Mode (Windows)
 
-~~~powershell
-docker compose up --build
-~~~
-
-5. When both services have started, open:
-
-   - http://localhost:3000 for MarketMind
-   - http://localhost:8000/docs for the API documentation
-   - http://localhost:8000/api/health for diagnostics
-
-6. In a second PowerShell window, verify the local stack:
-
-~~~powershell
-.scriptserify-local.ps1
-~~~
-
-Use Ctrl + C in the Compose window to stop MarketMind. Start it again later with docker compose up.
-
-### macOS with Docker Desktop
+### Recommended one-click Docker startup
 
 1. Install and start Docker Desktop.
-2. Open Terminal in the MarketMind folder.
-3. Create configuration and start:
+2. Open PowerShell in this repository.
+3. Run:
 
-~~~bash
-cp .env.example .env
-docker compose up --build
-~~~
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+./scripts/start-marketmind.ps1
+```
 
-4. Open http://localhost:3000 in a browser.
-5. Verify from another Terminal window:
+The helper creates a safe demo `.env` when needed, starts Docker Compose without deleting data, waits for the API health check, and opens `http://localhost:3000`.
 
-~~~bash
-chmod +x scripts/verify-local.sh
-./scripts/verify-local.sh
-~~~
+Stop the local stack while preserving its PostgreSQL volume:
 
-### Run without Docker
+```powershell
+./scripts/stop-marketmind.ps1
+```
 
-Requirements: Python 3.12 or later and Node.js 22 or later.
+### Manual startup
 
-Windows PowerShell:
-
-~~~powershell
+```powershell
 Copy-Item .env.example .env
-py -3.12 -m venv .venv
-..venvScriptsActivate.ps1
-pip install -r backendequirements.txt
-Set-Location frontend
-npm install
-Set-Location ..
-..venvScriptspython -m alembic -c backendalembic.ini upgrade head
-~~~
+docker compose up --build
+```
 
-Start the backend in its own PowerShell:
+Open `http://localhost:3000`. API diagnostics are at `http://localhost:8000/api/health` and API documentation is at `http://localhost:8000/docs`.
 
-~~~powershell
-..venvScriptspython -m uvicorn app.main:app --app-dir backend --reload --host 0.0.0.0 --port 8000
-~~~
+No API keys are required. Empty provider credentials deliberately activate visible **DEMO DATA**.
 
-Start the frontend in another PowerShell:
+## Cloud Mode
 
-~~~powershell
-Set-Location frontend
-npm run dev
-~~~
+Deploy the frontend and backend as separate HTTPS services. The recommended first deployment is:
 
-macOS or Linux:
+```text
+Vercel (Next.js PWA)  ->  Render or Railway (FastAPI container)  ->  managed PostgreSQL
+```
 
-~~~bash
-cp .env.example .env
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r backend/requirements.txt
-(cd frontend && npm install)
-(cd backend && alembic upgrade head)
-~~~
+The computer running this repository does not need to remain powered on after cloud deployment. The complete beginner-oriented procedure is in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
-Then use separate terminals:
+Use the provider-generated URLs first. A custom domain is optional and no code depends on one.
 
-~~~bash
-source .venv/bin/activate
-uvicorn app.main:app --app-dir backend --reload --host 0.0.0.0 --port 8000
-~~~
+## Environment variables
 
-~~~bash
-cd frontend
-npm run dev
-~~~
+Copy `.env.example` and keep secrets only in the backend host configuration.
 
-The frontend and backend bind to 0.0.0.0. They are available at ports 3000 and 8000 respectively.
+| Variable | Where | Purpose |
+| --- | --- | --- |
+| `MARKETMIND_ENV` | backend | `development` locally; `production` in the cloud |
+| `DATABASE_URL` | backend | SQLite locally or `postgresql+asyncpg://...` in production |
+| `FRONTEND_ORIGIN`, `CORS_ORIGINS` | backend | Explicit HTTPS frontend origin(s) in production |
+| `OPENAI_API_KEY`, `ALPACA_*`, `SEC_USER_AGENT` | backend | Optional provider credentials only |
+| `ENABLE_PAPER_TRADING` | backend | Enables paper-broker integration |
+| `ENABLE_REMOTE_PAPER_ORDERS` | backend | Defaults to `false`; leave it false for public deployments without authentication |
+| `ENABLE_LIVE_TRADING` | backend | Defaults to `false`; do not enable it |
+| `BACKEND_URL` | frontend host only | Server-side Next.js rewrite target, for example `https://marketmind-api.example-host.app` |
+| `NEXT_PUBLIC_API_BASE_URL` | frontend build | Optional direct API base URL; it is public and must never contain a secret |
 
-## iPhone and iPad access on your home network
+## Security status
 
-1. Keep MarketMind running and connect the phone or tablet to the same Wi-Fi as the computer.
-2. On Windows, run ipconfig and find the IPv4 address for the active Wi-Fi adapter. On macOS, run ipconfig getifaddr en0.
-3. On the device, open http://YOUR_COMPUTER_IP:3000. Example: http://192.168.1.42:3000.
-4. If it does not open, allow incoming TCP port 3000 through the computer firewall and confirm the Wi-Fi is not a guest or isolated network.
-5. In Safari choose Share, then Add to Home Screen. The supplied web manifest enables standalone app presentation.
+MarketMind does **not** currently implement user authentication. Its cloud deployment is therefore appropriate only for a protected personal deployment while in demo/read-only mode.
 
-The tablet layout preserves a compact two-column terminal at 768 to 1279 pixels. Phones use a single-column priority layout, bottom navigation, and scrollable market tables rather than squeezing the desktop layout into a narrow viewport. Use the top-right panel icon for kiosk mode on a dedicated iPad display.
+**Do not connect live broker credentials to a publicly accessible deployment until authentication is configured.** Live trading remains disabled by default. Production also disables remote paper-order submission by default, even when paper trading is configured.
 
-## Optional data providers
+Do not commit `.env`, database files, or provider keys. The API returns no secret values to the browser. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for deployment-safe configuration and access guidance.
 
-| Environment variable | Purpose |
-| --- | --- |
-| ALPACA_API_KEY and ALPACA_SECRET_KEY | Alpaca stocks, news, options data, and paper account |
-| ALPACA_BASE_URL | Paper brokerage URL; defaults to Alpaca paper |
-| ALPACA_DATA_URL | Market-data URL; defaults to Alpaca data |
-| ALPACA_FEED | Market-data feed; defaults to iex |
-| OPENAI_API_KEY | Optional structured AI interpretation |
-| OPENAI_MODEL | Model used only by the server-side OpenAI adapter |
-| ENABLE_OPENAI_ANALYSIS | Must be true before MarketMind sends any OpenAI request |
-| SEC_USER_AGENT | Descriptive identity required before live EDGAR fetching |
-| DATABASE_URL | SQLite local URL or PostgreSQL async URL |
-| ENABLE_PAPER_TRADING | Enables paper-broker integration |
-| ENABLE_LIVE_TRADING | Defaults to false; no live adapter is installed |
-| CORS_ORIGINS | Comma-separated direct API origins |
+## Validation
 
-To enable EDGAR, replace the example SEC user agent with a descriptive application name and a real contact email. This avoids sending the placeholder identity to SEC systems.
-
-### Provider and data labels
-
-- LIVE means a request was supplied by a configured provider.
-- DEMO means deterministic synthetic data.
-- MIXED means the view combines provider and fallback results.
-- Offline rules AI is a deterministic, no-key fallback; OpenAI is used only when a key is configured.
-- Alpaca options may return delayed indicative data depending on the account feed. Missing values are shown as a dash, never fabricated as live data.
-- Paper broker state is visibly distinct from live. MarketMind has no autonomous real-money execution path.
-
-## Diagnostics, migrations, and verification
-
-The API health endpoint reports backend, database, market adapter, AI adapter, SEC configuration, and broker mode:
-
-http://localhost:8000/api/health
-
-Docker runs Alembic before FastAPI starts. Local migration:
-
-~~~bash
-cd backend
-alembic upgrade head
-~~~
-
-The first migration handles a fresh database and adds the prediction-evaluation fields to an older local schema. For an obsolete disposable demo database, stopping the stack and removing its local data is also safe; never remove a database that contains work you need.
-
-Useful commands:
-
-~~~bash
-make test
-make lint
-make build
-make migrate
-~~~
-
-Windows users can run the underlying commands in the non-Docker section instead of installing make.
-
-The post-start verification scripts check required files, .env, Compose syntax, backend health, database connectivity reported by the API, and frontend availability:
-
-~~~powershell
-.scriptserify-local.ps1
-~~~
-
-~~~bash
-./scripts/verify-local.sh
-~~~
-
-## Testing
-
-Backend tests cover indicators, scoring, risk authority, no-look-ahead backtest calculations, AI schema validation, health diagnostics, demo scanning, and prediction persistence.
-
-~~~bash
+```powershell
 cd backend
 pytest -q
-~~~
 
-Frontend checks:
-
-~~~bash
-cd frontend
-npm run lint
+cd ../frontend
 npm run typecheck
+npm run lint
 npm run build
-~~~
+```
 
-Run these on the local computer after installation. A static check alone is not a successful runtime test.
+The production health endpoint checks API and database availability:
 
-## Important limits
+```text
+GET /api/health
+```
 
-- Full NYSE/Nasdaq breadth requires a licensed exchange-wide feed. MarketMind labels the available calculation Universe Breadth.
-- Demo fundamentals, options, news, filings, historical bars, and paper fills are synthetic and visibly labeled.
-- Backtests are research tools. They do not model every corporate action, tax, partial fill, data-revision, liquidity, or survivorship effect.
-- The options Strategy Lab calculates payoff summaries from available chain values. It is not a suitability check or a trade recommendation.
-- Production use should add authentication, encrypted secret management, rate-limited job execution, observation tooling, and licensed point-in-time datasets.
+It reports backend, database, market provider, AI provider, SEC, broker, paper-order safety, and live-trading state without exposing credentials.

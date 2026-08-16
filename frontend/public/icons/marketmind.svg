@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title">
+  <title>MarketMind</title>
+  <defs>
+    <linearGradient id="surface" x1="72" y1="58" x2="446" y2="454" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#122a2e"/>
+      <stop offset="1" stop-color="#061114"/>
+    </linearGradient>
+    <linearGradient id="signal" x1="138" y1="367" x2="377" y2="141" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#35caa0"/>
+      <stop offset="1" stop-color="#70caff"/>
+    </linearGradient>
+    <filter id="glow" x="-35%" y="-35%" width="170%" height="170%">
+      <feGaussianBlur stdDeviation="12" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="#061013"/>
+  <rect x="25" y="25" width="462" height="462" rx="96" fill="url(#surface)" stroke="#2e5d5c" stroke-width="3"/>
+  <path d="M117 348V180c0-18 15-33 33-33h53c15 0 28 10 32 24l21 75 21-75c4-14 17-24 32-24h53c18 0 33 15 33 33v168" fill="none" stroke="#1c4545" stroke-width="30" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M117 348V180c0-18 15-33 33-33h53c15 0 28 10 32 24l21 75 21-75c4-14 17-24 32-24h53c18 0 33 15 33 33v168" fill="none" stroke="url(#signal)" stroke-width="14" stroke-linecap="round" stroke-linejoin="round" filter="url(#glow)"/>
+  <path d="M130 349h66l36-42 45 28 48-72 50 18" fill="none" stroke="#d7fff4" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="375" cy="281" r="9" fill="#d7fff4"/>
+  <path d="M130 390h252" stroke="#3d7771" stroke-width="7" stroke-linecap="round" opacity=".7"/>
+</svg>

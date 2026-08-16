@@ -36,9 +36,19 @@ app = FastAPI(title="MarketMind API", version="1.1.0", lifespan=lifespan)
 settings = get_settings()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[origin.strip() for origin in settings.cors_origins.split(",") if origin.strip()],
-    allow_methods=["*"], allow_headers=["*"], allow_credentials=True,
+    allow_origins=settings.cors_origin_list,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"], allow_credentials=False,
 )
+
+
+@app.middleware("http")
+async def security_headers(request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    return response
 
 DEFAULT_USER_SETTINGS: dict[str, Any] = {
     "timezone": "America/New_York",
@@ -127,6 +137,7 @@ async def health(response: Response, db: AsyncSession = Depends(get_db)):
         "ai_provider": "openai enabled" if settings.openai_enabled else "rules fallback",
         "sec": "configured" if settings.sec_is_configured else "available — configure SEC_USER_AGENT",
         "broker": "alpaca paper configured" if not settings.demo_mode else "demo paper",
+        "paper_order_submission": "enabled" if settings.paper_order_submission_enabled else "disabled by public-deployment safety",
         "live_trading": "disabled" if not settings.enable_live_trading else "confirmation required; adapter not installed",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -351,6 +362,8 @@ async def preview_paper_order(order: PaperOrderRequest, db: AsyncSession = Depen
 
 @app.post("/api/trading/orders")
 async def submit_paper_order(order: PaperOrderRequest, db: AsyncSession = Depends(get_db)):
+    if not settings.paper_order_submission_enabled:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Paper order submission is disabled in production until authentication is configured.")
     if not order.confirmed:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Explicit confirmation is required before a paper order is submitted.")
     preview = await preview_paper_order(order, db)
@@ -374,6 +387,7 @@ async def get_settings_endpoint(db: AsyncSession = Depends(get_db)):
             "OpenAI": "Connected" if settings.openai_enabled else "Offline (rules fallback)",
             "SEC": "Configured" if settings.sec_is_configured else "Available — configure User-Agent",
             "Broker": "Demo Paper" if settings.demo_mode else "Alpaca Paper configured",
+            "Paper order submission": "Enabled" if settings.paper_order_submission_enabled else "Disabled in production until authentication is configured",
             "Live Trading": "Disabled",
         },
     }

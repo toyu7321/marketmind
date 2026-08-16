@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title">
+  <title>MarketMind maskable icon</title>
+  <defs>
+    <radialGradient id="surface" cx="50%" cy="35%" r="78%"><stop stop-color="#18343a"/><stop offset="1" stop-color="#061013"/></radialGradient>
+    <linearGradient id="signal" x1="160" y1="350" x2="365" y2="155" gradientUnits="userSpaceOnUse"><stop stop-color="#35caa0"/><stop offset="1" stop-color="#70caff"/></linearGradient>
+  </defs>
+  <rect width="512" height="512" fill="#061013"/>
+  <circle cx="256" cy="256" r="220" fill="url(#surface)" stroke="#2d6460" stroke-width="4"/>
+  <path d="M145 349V190c0-16 13-29 29-29h45c13 0 24 9 28 21l20 70 20-70c4-12 15-21 28-21h45c16 0 29 13 29 29v159" fill="none" stroke="url(#signal)" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M152 352h64l36-42 43 27 48-71 43 16" fill="none" stroke="#e1fff6" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M158 391h196" stroke="#4b8980" stroke-width="8" stroke-linecap="round"/>
+</svg>

@@ -1,10 +1,14 @@
 import type {NextConfig} from 'next';
 
-const backend = process.env.BACKEND_URL || 'http://localhost:8000';
+const configuredBackend = process.env.BACKEND_URL || process.env.NEXT_PUBLIC_API_BASE_URL;
+const backend = (configuredBackend || (process.env.NODE_ENV === 'development' ? 'http://localhost:8000' : undefined))?.replace(/\/?api\/?$/, '');
 const nextConfig: NextConfig = {
   output: process.env.MARKETMIND_STANDALONE === 'true' ? 'standalone' : undefined,
+  async headers() {
+    return [{source: '/sw.js', headers: [{key: 'Cache-Control', value: 'no-cache, no-store, must-revalidate'}]}];
+  },
   async rewrites() {
-    return [{source: '/api/:path*', destination: backend + '/api/:path*'}];
+    return backend ? [{source: '/api/:path*', destination: backend + '/api/:path*'}] : [];
   },
 };
 
