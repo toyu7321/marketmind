@@ -28,6 +28,12 @@ The `users` table has a random UUID primary key plus a unique provider `auth_sub
 - The Security page supports TOTP enrollment and verification. Passkeys/WebAuthn are deliberately a future additive factor rather than a substitute for the working TOTP path.
 - Administrators cannot demote or deactivate themselves through the console; a separate active administrator should be maintained for recovery.
 
+### One-time remote first-admin bootstrap
+
+For hosts without an operator shell, `POST /api/admin/bootstrap` is a deliberately temporary first-admin mechanism. It is not an account-creation API: it returns `404` unless `BOOTSTRAP_ADMIN_ENABLED=true`, requires the server-only `X-Bootstrap-Secret` header using constant-time comparison, verifies the supplied Supabase user through the provider Admin API, and is rate-limited to three requests per source per hour by default.
+
+The request can contain only `auth_subject`, `email`, and `display_name`; it cannot choose a role, bypass identity verification, enable recovery mode, or carry any provider credential. The first valid request creates/maps exactly one `ADMIN` and writes `ADMIN_BOOTSTRAPPED`. A retry with the exact same verified identity is a `200` no-op; a different request after an administrator exists is rejected with `409`. Disable the flag and delete the bootstrap secret immediately after the response is confirmed. The full Render procedure is in [DEPLOYMENT.md](DEPLOYMENT.md#4-bootstrap-the-first-administrator-without-a-shell).
+
 ## Tenant isolation and IDOR prevention
 
 Every private resource uses an opaque UUID and a `user_id` ownership column. The API filters list requests by `user_id` and loads detail requests through a shared ownership helper that returns a generic `404` for both missing and foreign resources. This avoids confirming another account's records exist.
@@ -77,7 +83,7 @@ Avoid putting secrets, broker account identifiers, raw IPs, or raw request bodie
 
 1. Configure Supabase Auth and disable public signups.
 2. Set production environment variables described in [DEPLOYMENT.md](DEPLOYMENT.md).
-3. Run `alembic upgrade head` and bootstrap the first administrator from a trusted backend shell.
+3. Run `alembic upgrade head` and bootstrap the first administrator through a trusted backend shell or the short-lived documented remote bootstrap mechanism.
 4. Enroll MFA for every administrator before accessing the Admin Console.
 5. Invite non-admin users from the console; do not use the public signup endpoint.
 6. Keep remote paper orders and live trading disabled until an additional broker/OAuth/security review.

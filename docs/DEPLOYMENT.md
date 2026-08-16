@@ -59,6 +59,9 @@ SUPABASE_PUBLISHABLE_KEY=sb_publishable_...
 SUPABASE_SECRET_KEY=sb_secret_...
 AUDIT_IP_HMAC_SECRET=<generate-a-long-random-secret>
 ADMIN_MFA_REQUIRED=true
+BOOTSTRAP_ADMIN_ENABLED=false
+BOOTSTRAP_ADMIN_SECRET=
+BOOTSTRAP_ADMIN_RATE_LIMIT_PER_HOUR=3
 AUTO_CREATE_SCHEMA=false
 
 ENABLE_PAPER_TRADING=true
@@ -79,22 +82,35 @@ Use the host’s encrypted environment-variable facility. Never put the secret k
 
 At this stage, visit `https://YOUR_API/api/health`. It should return `healthy`, `authentication: configured`, and `live_trading: locked`, without secret values.
 
-## 4. Bootstrap the first administrator
+## 4. Bootstrap the first administrator without a shell
 
-Open a secure host shell for the deployed backend (or run against the production database from a restricted operator workstation) and execute:
+This temporary procedure is for Render Free and other hosts where an operator shell is unavailable. It does **not** create a permanent public administrator endpoint.
 
-```bash
-cd backend
-python scripts/bootstrap_admin.py \
-  --auth-subject "SUPABASE-USER-UUID" \
-  --email "admin@example.com" \
-  --display-name "MarketMind Administrator" \
-  --confirm
-```
+1. In Render, set `BOOTSTRAP_ADMIN_ENABLED=true`.
+2. Generate a high-entropy, unique secret of at least 32 characters in a password manager. Set it as `BOOTSTRAP_ADMIN_SECRET` in Render. Do not put it in Git, Vercel, a `NEXT_PUBLIC_*` value, or the request body.
+3. Keep `ENABLE_LIVE_TRADING=false` and `ENABLE_REMOTE_PAPER_ORDERS=false`, then redeploy the backend.
+4. After the deployment is healthy, call the backend URL exactly once. Store the secret in a shell variable so it is sent only in the dedicated header:
 
-This script only maps an existing Supabase user to a MarketMind `ADMIN` account. It accepts no password or authentication token. Sign in through the deployed UI, enroll TOTP under **Security**, then use **Admin Console** to invite every additional user.
+   ```bash
+   export BOOTSTRAP_ADMIN_SECRET='paste-the-strong-render-secret-here'
+   curl --fail-with-body --request POST "https://YOUR_API_HOST/api/admin/bootstrap" \
+     --header "Content-Type: application/json" \
+     --header "X-Bootstrap-Secret: ${BOOTSTRAP_ADMIN_SECRET}" \
+     --data '{
+       "auth_subject": "cd384bcf-b533-4a71-909d-43552daa0abd",
+       "email": "yu788317@gmail.com",
+       "display_name": "Yu"
+     }'
+   unset BOOTSTRAP_ADMIN_SECRET
+   ```
 
-Keep at least two active MFA-enrolled administrators. If the sole administrator loses access, use this script from a trusted operator environment after verifying the intended Supabase subject.
+   The endpoint verifies that this subject exists in Supabase and that its provider email matches the request. It returns a redacted user view with `status: "bootstrapped"`; it never returns the bootstrap secret, provider key, JWT, or database connection string.
+
+5. Confirm the response shows `role: "ADMIN"`, sign in at the Vercel URL, and enroll TOTP in **Security**. An exact retry returns `200` with `already_bootstrapped` and creates no duplicate; a different second candidate is rejected.
+6. Immediately set `BOOTSTRAP_ADMIN_ENABLED=false` in Render, delete `BOOTSTRAP_ADMIN_SECRET` from Render, and redeploy again. A disabled endpoint returns `404` and there is no user-facing UI for it.
+7. Use **Admin Console** for all future invitations. Keep at least two active MFA-enrolled administrators.
+
+For a non-Render recovery process, the separately documented `backend/scripts/bootstrap_admin.py` remains available only from a trusted operator environment after verifying the intended Supabase subject.
 
 ## 5. Deploy the Next.js PWA on Vercel
 

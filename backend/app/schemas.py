@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Literal
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 
@@ -158,6 +159,14 @@ class InviteUserRequest(StrictModel):
     email: EmailStr
     display_name: str = Field(default="", max_length=120)
     role: Literal["ADMIN", "USER"] = "USER"
+
+
+class BootstrapAdminRequest(StrictModel):
+    """The temporary bootstrap contract intentionally contains no role or recovery switch."""
+
+    auth_subject: UUID
+    email: EmailStr
+    display_name: str = Field(default="", max_length=120)
 
 
 class UserAdminUpdate(StrictModel):

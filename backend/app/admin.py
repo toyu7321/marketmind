@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hmac
 from typing import Any
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import get_settings
 from .database import ActiveSession, AuditEvent, BrokerConnection, Invitation, SystemSetting, User, get_db, utcnow
-from .schemas import GlobalSecurityUpdate, InviteUserRequest, UserAdminUpdate
-from .security import Principal, require_admin, write_audit
+from .schemas import BootstrapAdminRequest, GlobalSecurityUpdate, InviteUserRequest, UserAdminUpdate
+from .security import Principal, client_rate_limit_subject, rate_limiter, require_admin, write_audit
 
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -49,6 +50,111 @@ async def _supabase_invite(payload: InviteUserRequest) -> dict[str, Any]:
             return response.json()
     except httpx.HTTPError as error:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Invitation provider could not complete the request.") from error
+
+
+async def _supabase_user_by_id(auth_subject: str) -> dict[str, Any]:
+    """Fetch a user through the server-only Supabase Admin API.
+
+    This deliberately accepts only a UUID validated by the request schema and
+    returns no provider credentials to callers or audit metadata.
+    """
+    settings = get_settings()
+    if not settings.auth_ready or not settings.supabase_secret_key:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Bootstrap identity verification is unavailable.")
+    try:
+        async with httpx.AsyncClient(timeout=8.0, follow_redirects=False) as client:
+            response = await client.get(
+                f"{settings.supabase_url.rstrip('/')}/auth/v1/admin/users/{auth_subject}",
+                headers={"apikey": settings.supabase_secret_key, "Authorization": f"Bearer {settings.supabase_secret_key}"},
+            )
+    except httpx.HTTPError as error:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Bootstrap identity verification is unavailable.") from error
+    if response.status_code == status.HTTP_404_NOT_FOUND:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="The supplied identity could not be verified.")
+    try:
+        response.raise_for_status()
+        payload = response.json()
+    except (httpx.HTTPError, ValueError) as error:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Bootstrap identity verification is unavailable.") from error
+    user = payload.get("user", payload) if isinstance(payload, dict) else None
+    if not isinstance(user, dict) or str(user.get("id", "")) != auth_subject:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="The supplied identity could not be verified.")
+    return user
+
+
+async def _bootstrap_rate_limit(request: Request) -> None:
+    settings = get_settings()
+    await rate_limiter.check(
+        "admin-bootstrap",
+        client_rate_limit_subject(request),
+        limit=settings.bootstrap_admin_rate_limit_per_hour,
+        window_seconds=3600,
+    )
+
+
+@router.post("/bootstrap", status_code=status.HTTP_201_CREATED)
+async def bootstrap_first_admin(
+    payload: BootstrapAdminRequest,
+    request: Request,
+    response: Response,
+    bootstrap_secret: str | None = Header(default=None, alias="X-Bootstrap-Secret"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create the first admin only during a deliberate, short-lived deployment window."""
+    settings = get_settings()
+    # A generic not-found response avoids advertising a permanent public route.
+    if not settings.bootstrap_admin_enabled:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resource not found.")
+    await _bootstrap_rate_limit(request)
+    if not settings.bootstrap_admin_secret or not bootstrap_secret or not hmac.compare_digest(bootstrap_secret, settings.bootstrap_admin_secret):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Bootstrap authorization was not accepted.")
+
+    subject = str(payload.auth_subject)
+    provider_user = await _supabase_user_by_id(subject)
+    provider_email = str(provider_user.get("email") or "").strip().lower()
+    requested_email = str(payload.email).strip().lower()
+    if not provider_email or provider_email != requested_email:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="The supplied identity and email do not match.")
+
+    existing_admin = (await db.execute(select(User).where(User.role == "ADMIN").limit(1))).scalar_one_or_none()
+    if existing_admin is not None:
+        if existing_admin.auth_subject == subject and existing_admin.email.lower() == requested_email:
+            # Retries from a failed network response are harmless, but never create
+            # another account or reopen bootstrap for a different identity.
+            await write_audit(db, request, event_type="ADMIN_BOOTSTRAP_REPLAY", user_id=existing_admin.id, resource="admin/bootstrap")
+            await db.commit()
+            response.status_code = status.HTTP_200_OK
+            return {"status": "already_bootstrapped", "user": user_view(existing_admin)}
+        await write_audit(db, request, event_type="ADMIN_BOOTSTRAP_REJECTED", resource="admin/bootstrap", result="DENIED", safe_metadata={"reason": "administrator_already_exists"})
+        await db.commit()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Bootstrap has already been completed.")
+
+    matching_subject = (await db.execute(select(User).where(User.auth_subject == subject))).scalar_one_or_none()
+    matching_email = (await db.execute(select(User).where(User.email == requested_email))).scalar_one_or_none()
+    if matching_subject and matching_email and matching_subject.id != matching_email.id:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="A local account mapping conflict must be resolved by an administrator.")
+    user = matching_subject or matching_email
+    if user is None:
+        user = User(
+            auth_subject=subject,
+            email=requested_email,
+            display_name=payload.display_name,
+            role="ADMIN",
+            is_active=True,
+            email_verified=bool(provider_user.get("email_confirmed_at")),
+        )
+        db.add(user)
+    else:
+        user.auth_subject = subject
+        user.email = requested_email
+        user.display_name = payload.display_name or user.display_name
+        user.role = "ADMIN"
+        user.is_active = True
+        user.email_verified = bool(provider_user.get("email_confirmed_at"))
+    await db.flush()
+    await write_audit(db, request, event_type="ADMIN_BOOTSTRAPPED", user_id=user.id, resource="admin/bootstrap")
+    await db.commit()
+    return {"status": "bootstrapped", "user": user_view(user)}
 
 
 @router.get("/users")

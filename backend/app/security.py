@@ -108,6 +108,16 @@ def _safe_user_agent(request: Request) -> str:
     return request.headers.get("user-agent", "")[:256]
 
 
+def client_rate_limit_subject(request: Request) -> str:
+    """Return a non-reversible in-memory rate-limit subject without storing an IP."""
+    settings = get_settings()
+    hashed = _client_ip_hash(request, settings)
+    if hashed:
+        return hashed
+    raw = request.client.host if request.client else "unknown"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
 async def write_audit(
     db: AsyncSession,
     request: Request,

@@ -97,6 +97,7 @@ Copy `.env.example` and keep secrets only in the backend host configuration.
 | `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY` | backend | Identity provider URL and public key used to verify browser-issued access tokens |
 | `SUPABASE_SECRET_KEY` | backend only | Server-only invitation capability; never expose it to Vercel/browser code |
 | `AUDIT_IP_HMAC_SECRET` | backend | Required production secret for privacy-preserving audit IP hashing |
+| `BOOTSTRAP_ADMIN_ENABLED`, `BOOTSTRAP_ADMIN_SECRET` | backend | Disabled-by-default, one-time remote first-admin setup only; remove the secret after use |
 | `ENABLE_PAPER_TRADING` | backend | Enables the paper-broker architecture, not unreviewed execution |
 | `ENABLE_REMOTE_PAPER_ORDERS` | backend | Defaults to `false`; current release stays preview-only even when configured |
 | `ENABLE_LIVE_TRADING` | backend | Must remain `false`; production rejects `true` |

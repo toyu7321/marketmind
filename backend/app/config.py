@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     admin_mfa_required: bool = True
     audit_ip_hmac_secret: str = ""
     rate_limit_per_minute: int = 120
+    # A deliberately short-lived remote-first-admin escape hatch. It never
+    # enables itself and must be removed from the host after one successful use.
+    bootstrap_admin_enabled: bool = False
+    bootstrap_admin_secret: str = ""
+    bootstrap_admin_rate_limit_per_hour: int = 3
     auto_create_schema: bool | None = None
 
     model_config = SettingsConfigDict(env_file="../.env", extra="ignore")
@@ -95,6 +100,10 @@ class Settings(BaseSettings):
                 raise ValueError("ENABLE_LIVE_TRADING must remain false until a separately reviewed release.")
             if not self.audit_ip_hmac_secret:
                 raise ValueError("Production requires AUDIT_IP_HMAC_SECRET for privacy-preserving audit metadata.")
+        if self.bootstrap_admin_enabled and len(self.bootstrap_admin_secret) < 32:
+            raise ValueError("BOOTSTRAP_ADMIN_ENABLED requires a BOOTSTRAP_ADMIN_SECRET of at least 32 characters.")
+        if self.bootstrap_admin_rate_limit_per_hour < 1 or self.bootstrap_admin_rate_limit_per_hour > 10:
+            raise ValueError("BOOTSTRAP_ADMIN_RATE_LIMIT_PER_HOUR must be between 1 and 10.")
         return self
 
     @property
