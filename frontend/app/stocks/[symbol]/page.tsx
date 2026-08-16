@@ -1,0 +1,1 @@
+import {Shell} from '@/components/shell';import {Stock} from '@/components/pages';export default async function Page({params}:{params:Promise<{symbol:string}>}){const {symbol}=await params;return <Shell><Stock symbol={symbol.toUpperCase()}/></Shell>}

@@ -1,0 +1,2 @@
+export async function api<T>(path:string,init?:RequestInit):Promise<T>{const res=await fetch(`/api${path}`,{...init,headers:{'Content-Type':'application/json',...(init?.headers||{})},cache:'no-store'});if(!res.ok)throw new Error('Market data temporarily unavailable');return res.json()}
+export const money=(v:number)=>new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',maximumFractionDigits:2}).format(v);

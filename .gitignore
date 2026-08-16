@@ -1,0 +1,10 @@
+.env
+*.db
+__pycache__/
+.pytest_cache/
+.venv/
+node_modules/
+.next/
+coverage/
+*.pyc
+/.local-verify/
