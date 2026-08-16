@@ -1,20 +1,23 @@
-const configuredBase = process.env.NEXT_PUBLIC_API_BASE_URL?.trim().replace(/\/+$/, '');
-
-function resolveApiBase() {
-  if (configuredBase) return configuredBase;
-  if (typeof window !== 'undefined' && ['localhost', '127.0.0.1'].includes(window.location.hostname)) return 'http://localhost:8000/api';
-  return '/api';
-}
-
-export function apiUrl(path: string) {
+function apiUrl(path: string) {
   const suffix = path.startsWith('/') ? path : `/${path}`;
-  const apiBase = resolveApiBase();
-  return `${apiBase.endsWith('/api') ? apiBase : `${apiBase}/api`}${suffix}`;
+  return `/api${suffix}`;
 }
 
-export async function api<T>(path:string,init?:RequestInit):Promise<T>{
-  const res=await fetch(apiUrl(path),{...init,headers:{'Content-Type':'application/json',...(init?.headers||{})},cache:'no-store'});
-  if(!res.ok)throw new Error('Market data temporarily unavailable');
-  return res.json();
+export class ApiError extends Error {
+  constructor(public readonly status: number, message: string) { super(message); }
 }
-export const money=(v:number)=>new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',maximumFractionDigits:2}).format(v);
+
+export async function api<T>(path: string, init?: RequestInit): Promise<T> {
+  const headers = new Headers(init?.headers);
+  if (init?.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+  const response = await fetch(apiUrl(path), {...init, headers, cache: 'no-store', credentials: 'same-origin'});
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    const detail = typeof payload.detail === 'string' ? payload.detail : 'MarketMind request could not be completed.';
+    if (response.status === 401 && typeof window !== 'undefined') window.location.assign('/login?reason=session');
+    throw new ApiError(response.status, detail);
+  }
+  return response.json() as Promise<T>;
+}
+
+export const money = (value: number) => new Intl.NumberFormat('en-US', {style: 'currency', currency: 'USD', maximumFractionDigits: 2}).format(value);

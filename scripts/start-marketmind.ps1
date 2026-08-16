@@ -1,6 +1,7 @@
 <#
-Starts the local Docker stack in demo mode (unless configured otherwise), waits
-for the API, and opens MarketMind. It never removes containers or database data.
+Starts the local Docker stack, waits for the API, and opens MarketMind. It never
+removes containers or database data. Optional market providers use demo data;
+private application pages still require configured Supabase Auth.
 #>
 param([switch]$NoBrowser, [int]$TimeoutSeconds = 90)
 
@@ -13,7 +14,7 @@ if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
 }
 if (-not (Test-Path '.env')) {
   Copy-Item '.env.example' '.env'
-  Write-Host 'Created .env with safe demo defaults.' -ForegroundColor Yellow
+  Write-Host 'Created .env with safe defaults. Add local Supabase values before signing in.' -ForegroundColor Yellow
 }
 
 docker compose up --detach --build
@@ -29,5 +30,5 @@ if (-not $health) {
   throw 'MarketMind did not pass its API health check in time.'
 }
 
-Write-Host "MarketMind is ready at http://localhost:3000 ($($health.market_provider) mode)." -ForegroundColor Green
+Write-Host "MarketMind is ready at http://localhost:3000 (auth: $($health.authentication); live trading: $($health.live_trading))." -ForegroundColor Green
 if (-not $NoBrowser) { Start-Process 'http://localhost:3000' }

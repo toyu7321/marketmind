@@ -1,177 +1,150 @@
-# Deploy MarketMind to the Internet
+# Deploy secure MarketMind
 
-This guide deploys the existing shared Next.js/FastAPI codebase. It does **not** create a separate Windows or iPhone application. After deployment, install the same HTTPS PWA on Windows and iPhone.
-
-The example uses Vercel for the frontend and Render for FastAPI/PostgreSQL because both support GitHub-connected deployments and generated HTTPS URLs. Railway, Fly.io, or another Docker-compatible host can substitute for Render; the backend has no vendor-specific runtime dependency.
-
-## Before you start
-
-You need accounts for:
-
-1. GitHub — this repository is the source of truth.
-2. A backend host with a managed PostgreSQL service (Render is the example below).
-3. Vercel for the Next.js frontend.
-
-You do **not** need a custom domain or market-data keys for the first deployment. Keep `ENABLE_LIVE_TRADING=false`.
-
-> Security warning: MarketMind has no login system yet. Do not deploy broker credentials or turn on remote paper orders on a publicly reachable app. Leave `ENABLE_REMOTE_PAPER_ORDERS=false` until a real authentication layer is added.
-
-## Part A — Deploy Backend
-
-Complete Part B first so you have the database URL, then create the API service:
-
-1. In Render, select **New +** then **Web Service** and connect `toyu7321/marketmind`.
-2. Select branch `main`.
-3. Set **Root Directory** to `backend`.
-4. Choose the Docker runtime. Render builds `backend/Dockerfile`; other container hosts should do the same.
-5. Set the health-check path to `/api/health`.
-6. Add these environment variables:
-
-| Key | First deployment value |
-| --- | --- |
-| `MARKETMIND_ENV` | `production` |
-| `DATABASE_URL` | Your internal `postgresql+asyncpg://...` URL |
-| `FRONTEND_ORIGIN` | A temporary HTTPS placeholder such as `https://marketmind-placeholder.vercel.app` |
-| `CORS_ORIGINS` | The same temporary HTTPS placeholder |
-| `ENABLE_PAPER_TRADING` | `true` |
-| `ENABLE_REMOTE_PAPER_ORDERS` | `false` |
-| `ENABLE_LIVE_TRADING` | `false` |
-| `ENABLE_OPENAI_ANALYSIS` | `false` unless you intentionally add an OpenAI key |
-| `SEC_USER_AGENT` | Leave the example until you are ready to configure a real SEC identity |
-
-7. Do not add Alpaca or OpenAI values yet. The deployed API is fully usable in **DEMO** mode.
-8. Deploy. The container runs `alembic upgrade head` and then starts Uvicorn on the host-provided `$PORT`.
-9. Copy the generated backend URL, for example `https://marketmind-api-xxxx.onrender.com`.
-10. Visit `https://YOUR_BACKEND/api/health`. It should return JSON with `status: "healthy"`, `database: "connected"`, and demo/provider statuses.
-
-Render supports Docker web services, environment variables, and HTTP health checks. Its health checker accepts a `2xx` or `3xx` result, so the existing database-aware endpoint is suitable.
-
-## Part B — Deploy PostgreSQL
-
-1. In Render, create a PostgreSQL database in the same region you will use for the API.
-2. Copy its **internal** database URL from the database connection page. Internal networking avoids exposing the database to the internet.
-3. MarketMind uses SQLAlchemy async drivers, so change the copied scheme from `postgresql://` to `postgresql+asyncpg://` before setting `DATABASE_URL` in Part A.
-4. Do not add this value to GitHub, Vercel, browser variables, or a frontend `.env` file.
-
-PostgreSQL is persistent managed storage. Do not put a production SQLite database inside the API container filesystem.
-
-## Part C — Deploy the Next.js PWA frontend on Vercel
-
-1. In Vercel, select **Add New → Project** and import `toyu7321/marketmind`.
-2. Before deploying, set **Root Directory** to `frontend`.
-3. Confirm the framework is Next.js. `frontend/vercel.json` uses the committed pnpm lockfile for the install and build commands.
-4. Add this environment variable for **Production** and **Preview**:
-
-| Key | Value |
-| --- | --- |
-| `BACKEND_URL` | The HTTPS backend URL from Part A, without `/api` |
-
-5. Leave `NEXT_PUBLIC_API_BASE_URL` blank for the recommended same-origin proxy setup. Browser requests stay at `/api/*` on the PWA origin and Vercel rewrites them server-side to `BACKEND_URL`.
-6. Deploy and copy the generated HTTPS URL, for example `https://marketmind-xxxx.vercel.app`.
-
-### Optional direct API mode
-
-Instead of the proxy, set `NEXT_PUBLIC_API_BASE_URL=https://YOUR_BACKEND` in Vercel. This value is compiled into browser JavaScript and must be public. In this mode, CORS configuration in Part D is required for every frontend origin.
-
-## Part D — Connect the frontend and backend safely
-
-Return to the API service environment variables and replace both temporary values with the actual Vercel URL:
+MarketMind is deployed as three HTTPS services:
 
 ```text
-FRONTEND_ORIGIN=https://marketmind-xxxx.vercel.app
-CORS_ORIGINS=https://marketmind-xxxx.vercel.app
+Vercel (Next.js PWA + same-origin API proxy)
+    -> Render / Railway (FastAPI)
+    -> managed PostgreSQL
+           ^
+Supabase Auth (identity, invitation email, sessions, TOTP MFA)
 ```
 
-Save and redeploy the API. Production startup rejects wildcard CORS origins and non-HTTPS origins by design. If you later add a custom domain, append it as a comma-separated explicit origin and redeploy:
+The frontend is a private application, not a public demo site. Configure identity before enabling a production backend; production startup fails closed if Supabase Auth, HTTPS CORS, or audit hashing are missing.
 
-```text
-CORS_ORIGINS=https://marketmind-xxxx.vercel.app,https://marketmind.example.com
+## 1. Create and configure Supabase Auth
+
+1. Create a Supabase project and save its project URL, **publishable/anon key**, and **secret/service-role key**. The secret key belongs only on the FastAPI host.
+2. In **Authentication → Providers**, keep Email enabled and configure a real transactional email sender before inviting external users.
+3. In **Authentication → Settings**, disable public sign-ups. MarketMind creates invited users through its administrator API only.
+4. In **URL Configuration**, set the Site URL to your Vercel URL and add each callback URL, for example:
+
+   ```text
+   https://marketmind-xxxx.vercel.app/auth/callback
+   https://marketmind.example.com/auth/callback
+   ```
+
+5. In **Multi-Factor Authentication**, enable TOTP. Administrators must enroll it before any administrator operation is accepted.
+6. In **JWT signing keys**, use an asymmetric ECC/RSA signing key compatible with the backend’s `ES256,RS256` allowlist. Do not add an `HS256` shared secret as a compatibility shortcut.
+7. Invite or create the very first administrator in the Supabase dashboard. Copy that user’s UUID from the Auth users page. Do not create a public password-signup flow.
+
+Supabase publishes its [Auth overview](https://supabase.com/docs/guides/auth), [server-side Next.js guidance](https://supabase.com/docs/guides/auth/server-side/creating-a-client), and [MFA/TOTP setup](https://supabase.com/docs/guides/auth/auth-mfa).
+
+## 2. Provision PostgreSQL and run the migration
+
+Create managed PostgreSQL in the same region as the FastAPI host. Copy its internal connection string and change the driver scheme to `postgresql+asyncpg://` for SQLAlchemy.
+
+Back up any existing MarketMind database before upgrading. In a trusted backend shell, run:
+
+```bash
+cd backend
+alembic upgrade head
 ```
 
-## Part E — Test the production deployment
+The security migration retains legacy settings and ownerless historical predictions but does not expose them as new users’ private data. It deliberately has no destructive automatic downgrade; restore a backup to roll back.
 
-1. Open the Vercel URL in a normal browser tab.
-2. Confirm **DEMO DATA** appears when no provider keys are configured.
-3. Open `https://YOUR_BACKEND/api/health` and confirm the database is connected.
-4. Visit Dashboard, Scanner, Stock Intel, Options, Backtest, Portfolio, and Settings.
-5. Turn airplane mode on after one successful visit, reopen the installed app, and confirm the offline shell truthfully states that live market services are unavailable.
-6. Publish a harmless change to `main`; the GitHub-connected hosts should rebuild automatically. When the installed PWA sees a new worker, choose **Refresh** rather than being force-reloaded.
+## 3. Deploy FastAPI on Render or Railway
 
-## Part F — Install the Windows app
-
-1. Open the Vercel HTTPS URL in Microsoft Edge or Chrome.
-2. Choose **Install MarketMind** from the address bar or browser menu.
-3. Confirm. Windows places the installed PWA in the Start Menu.
-4. Open it once, then right-click the Start Menu item to pin it to the taskbar. If required, use **Open file location** from the Start Menu item to create a desktop shortcut.
-
-The installed PWA opens in its own window. Do not use a `localhost` address for this normal daily workflow after cloud deployment.
-
-## Part G — Install the iPhone app
-
-1. Open the Vercel HTTPS URL in **Safari**.
-2. Tap **Share → Add to Home Screen**.
-3. Keep **Open as Web App** enabled if offered.
-4. Tap **Add**, then launch MarketMind from the Home Screen.
-
-Safari uses the supplied Apple touch icon and mobile web-app metadata. The PWA layout includes notch/Dynamic Island and home-indicator safe-area spacing.
-
-### Offline and update behavior
-
-The service worker caches only the application shell, icons, manifest, and already visited same-origin static assets. Navigation is network-first and falls back to `/offline`; API responses are deliberately never cached or presented as live market data. A newly downloaded service worker waits until the user selects the **Refresh** prompt, so MarketMind does not reload during active work.
-
-## Local Mode remains available
-
-Cloud deployment does not replace local mode. On Windows with Docker Desktop:
-
-```powershell
-Set-ExecutionPolicy -Scope Process Bypass
-./scripts/start-marketmind.ps1
-```
-
-This starts local frontend and backend at `http://localhost:3000` and `http://localhost:8000`. Stop safely with `./scripts/stop-marketmind.ps1`; it does not delete the database volume.
-
-## Environment-variable reference
-
-### Backend-only secrets and configuration
+Create a Docker web service from this repository with **Root Directory** `backend`, then configure its health check as `/api/health`. Set these server-only environment variables:
 
 ```text
 MARKETMIND_ENV=production
 DATABASE_URL=postgresql+asyncpg://USER:PASSWORD@HOST:PORT/DATABASE
 FRONTEND_ORIGIN=https://marketmind-xxxx.vercel.app
 CORS_ORIGINS=https://marketmind-xxxx.vercel.app
-OPENAI_API_KEY=
-OPENAI_MODEL=gpt-5-mini
-ENABLE_OPENAI_ANALYSIS=false
-ALPACA_API_KEY=
-ALPACA_SECRET_KEY=
-ALPACA_BASE_URL=https://paper-api.alpaca.markets
-ALPACA_DATA_URL=https://data.alpaca.markets
-ALPACA_FEED=iex
-SEC_USER_AGENT=YourApp your-email@example.com
+
+AUTH_MODE=required
+SUPABASE_URL=https://YOUR_PROJECT.supabase.co
+SUPABASE_PUBLISHABLE_KEY=sb_publishable_...
+SUPABASE_SECRET_KEY=sb_secret_...
+AUDIT_IP_HMAC_SECRET=<generate-a-long-random-secret>
+ADMIN_MFA_REQUIRED=true
+AUTO_CREATE_SCHEMA=false
+
 ENABLE_PAPER_TRADING=true
 ENABLE_REMOTE_PAPER_ORDERS=false
 ENABLE_LIVE_TRADING=false
+
+OPENAI_API_KEY=
+ENABLE_OPENAI_ANALYSIS=false
+ALPACA_API_KEY=
+ALPACA_SECRET_KEY=
+ALPACA_OAUTH_CLIENT_ID=
+ALPACA_OAUTH_CLIENT_SECRET=
+ALPACA_OAUTH_REDIRECT_URI=
+SEC_USER_AGENT=MarketMind security@example.com
 ```
 
-### Frontend host configuration
+Use the host’s encrypted environment-variable facility. Never put the secret key, audit HMAC secret, database URL, broker credentials, OAuth client secret, or token-store credentials in Vercel, Git, browser storage, `NEXT_PUBLIC_*`, or logs. The container runs Alembic during startup; a managed release command that runs `alembic upgrade head` before deployment is preferred for controlled production changes.
 
-```text
-BACKEND_URL=https://marketmind-api-xxxx.onrender.com
-NEXT_PUBLIC_API_BASE_URL=
+At this stage, visit `https://YOUR_API/api/health`. It should return `healthy`, `authentication: configured`, and `live_trading: locked`, without secret values.
+
+## 4. Bootstrap the first administrator
+
+Open a secure host shell for the deployed backend (or run against the production database from a restricted operator workstation) and execute:
+
+```bash
+cd backend
+python scripts/bootstrap_admin.py \
+  --auth-subject "SUPABASE-USER-UUID" \
+  --email "admin@example.com" \
+  --display-name "MarketMind Administrator" \
+  --confirm
 ```
 
-`NEXT_PUBLIC_API_BASE_URL` is the only frontend value and is intentionally public. Never prefix a secret with `NEXT_PUBLIC_`.
+This script only maps an existing Supabase user to a MarketMind `ADMIN` account. It accepts no password or authentication token. Sign in through the deployed UI, enroll TOTP under **Security**, then use **Admin Console** to invite every additional user.
 
-## Authentication and broker safety
+Keep at least two active MFA-enrolled administrators. If the sole administrator loses access, use this script from a trusted operator environment after verifying the intended Supabase subject.
 
-Authentication is not yet implemented. The API has validation, controlled CORS, backend-only secrets, disabled live trading, and a production guard that disables remote paper-order submission by default, but it is **not** a replacement for real user authentication.
+## 5. Deploy the Next.js PWA on Vercel
 
-Before connecting any broker account, add a vetted authentication and authorization layer (for example, an identity provider with server-side session enforcement), restrict production access to the intended user, and add audit logging. Never treat a private GitHub repository as access control for a deployed URL.
+1. Import the repository into Vercel and choose branch `main`.
+2. Set **Root Directory** to `frontend`.
+3. Leave the committed commands in place: `pnpm install --frozen-lockfile` and `pnpm run build`.
+4. Set these Vercel environment variables for Production and Preview:
 
-## GitHub deployment workflow
+   ```text
+   BACKEND_URL=https://marketmind-api-xxxx.onrender.com
+   NEXT_PUBLIC_SUPABASE_URL=https://YOUR_PROJECT.supabase.co
+   NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=sb_publishable_...
+   ```
 
-```text
-Codex or local change -> commit and push to main -> GitHub -> Vercel/Render rebuild -> installed PWA offers refresh
+   The two `NEXT_PUBLIC_` values are designed to be public. `BACKEND_URL` is server-only. Do not set `NEXT_PUBLIC_API_BASE_URL`: browser API calls remain same-origin, and the route handler verifies the Supabase session before forwarding a bearer token to FastAPI.
+
+5. Deploy and copy the generated Vercel HTTPS URL.
+6. Return to the backend configuration and replace temporary frontend origins with the exact Vercel URL. Add custom domains as explicit comma-separated HTTPS origins.
+
+The frontend will intentionally send an unauthenticated visitor to `/login`. A missing Supabase configuration sends a configuration warning rather than showing private market data.
+
+## 6. Production acceptance checklist
+
+1. Open the Vercel URL in a private browser session and confirm it redirects to Login.
+2. Sign in with the bootstrap account. Confirm dashboard data loads only after authentication.
+3. Visit **Security**, enroll and verify a TOTP authenticator, then confirm `aal2` access is shown.
+4. Visit **Admin Console** and confirm that non-admin or non-MFA sessions receive no user/audit data.
+5. Invite a standard user and confirm the user can see only their own settings, predictions, portfolio, broker connections, backtests, strategies, orders, and sessions.
+6. Enable the global kill switch as an MFA-enabled administrator. Confirm every paper order attempt is rejected. Release it only after deliberate confirmation.
+7. Confirm `/api/health` exposes no token, database URL, provider secret, or raw audit data.
+8. Use browser developer tools to verify `/api/*` responses have `Cache-Control: no-store`; go offline and confirm the PWA does not display stale account/market API content.
+9. Keep `ENABLE_REMOTE_PAPER_ORDERS=false` and `ENABLE_LIVE_TRADING=false`. The present release is secure preview-only for trading.
+
+## 7. Local development
+
+For the zero-credential demo shell, Docker remains available:
+
+```powershell
+Copy-Item .env.example .env
+docker compose up --build
 ```
 
-Vercel supports selecting a monorepo root directory for its project. Render can build the backend Dockerfile from its own root directory and uses `/api/health` for readiness. See the official [Vercel monorepo guide](https://vercel.com/docs/monorepos), [Vercel build configuration](https://vercel.com/docs/builds/configure-a-build), [Render Docker guide](https://render.com/docs/docker), and [Render health-check guide](https://render.com/docs/health-checks) for provider UI changes.
+The demo shell intentionally does not bypass authentication for private data. Configure a local Supabase project and set the public/secret keys when testing the signed-in workflow. Use an HTTPS tunnel or a provider-supported local callback URL for OAuth/MFA experiments; do not expose a development database or `.env` publicly.
+
+## Operational notes
+
+- The service worker only caches static assets. It does not cache navigations or `/api/*` responses.
+- The bundled rate limiter is per backend process. Introduce a shared Redis-backed rate limiter before running multiple API replicas.
+- OAuth broker tokens are not stored by the application. Do not enable a broker callback or remote paper execution until a reviewed encrypted secret manager and token-rotation design are in place.
+- Live trading is not supported by this release. `ENABLE_LIVE_TRADING=true` is rejected in production.
+- Rotate Supabase, audit HMAC, broker, and database credentials through their host/provider controls and review the MarketMind audit log after a suspected incident.
+
+For the detailed controls and threat boundaries, read [SECURITY.md](SECURITY.md).

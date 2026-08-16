@@ -10,7 +10,8 @@ MarketMind is research software, not investment advice. It does not promise resu
 
 - Dashboard, markets, scanner, stock intelligence, news, options, predictions, backtesting, portfolio, paper trading, and settings.
 - FastAPI provider boundaries with explicit Alpaca, OpenAI, SEC EDGAR, options, and broker fallbacks.
-- A clearly labelled zero-credential demo mode that works locally and in the cloud.
+- An invite-only, fail-closed multi-user foundation with Supabase Auth, TOTP MFA, server-verified JWTs, per-user ownership, audit events, and security controls.
+- Clearly labelled demo market data when optional market-data, news, AI, or SEC credentials are absent.
 - Installable PWA metadata, self-hosted app icons, Apple metadata, offline application shell, update prompt, and standalone launch screen.
 - Desktop, tablet, and phone layouts with a bottom navigation and iPhone safe-area support.
 - Docker Compose, SQLite local fallback, PostgreSQL production support, Alembic migrations, health diagnostics, and validation scripts.
@@ -69,7 +70,7 @@ docker compose up --build
 
 Open `http://localhost:3000`. API diagnostics are at `http://localhost:8000/api/health` and API documentation is at `http://localhost:8000/docs`.
 
-No API keys are required. Empty provider credentials deliberately activate visible **DEMO DATA**.
+Market-data and AI keys are optional: empty provider credentials deliberately activate visible **DEMO DATA** after sign-in. Authentication is intentionally not optional for private application data. Configure a local Supabase project before using Dashboard, Scanner, Portfolio, or Settings.
 
 ## Cloud Mode
 
@@ -93,19 +94,22 @@ Copy `.env.example` and keep secrets only in the backend host configuration.
 | `DATABASE_URL` | backend | SQLite locally or `postgresql+asyncpg://...` in production |
 | `FRONTEND_ORIGIN`, `CORS_ORIGINS` | backend | Explicit HTTPS frontend origin(s) in production |
 | `OPENAI_API_KEY`, `ALPACA_*`, `SEC_USER_AGENT` | backend | Optional provider credentials only |
-| `ENABLE_PAPER_TRADING` | backend | Enables paper-broker integration |
-| `ENABLE_REMOTE_PAPER_ORDERS` | backend | Defaults to `false`; leave it false for public deployments without authentication |
-| `ENABLE_LIVE_TRADING` | backend | Defaults to `false`; do not enable it |
-| `BACKEND_URL` | frontend host only | Server-side Next.js rewrite target, for example `https://marketmind-api.example-host.app` |
-| `NEXT_PUBLIC_API_BASE_URL` | frontend build | Optional direct API base URL; it is public and must never contain a secret |
+| `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY` | backend | Identity provider URL and public key used to verify browser-issued access tokens |
+| `SUPABASE_SECRET_KEY` | backend only | Server-only invitation capability; never expose it to Vercel/browser code |
+| `AUDIT_IP_HMAC_SECRET` | backend | Required production secret for privacy-preserving audit IP hashing |
+| `ENABLE_PAPER_TRADING` | backend | Enables the paper-broker architecture, not unreviewed execution |
+| `ENABLE_REMOTE_PAPER_ORDERS` | backend | Defaults to `false`; current release stays preview-only even when configured |
+| `ENABLE_LIVE_TRADING` | backend | Must remain `false`; production rejects `true` |
+| `BACKEND_URL` | frontend host only | Server-side same-origin API proxy target, for example `https://marketmind-api.example-host.app` |
+| `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | frontend host | Public Supabase browser configuration; never place secrets under `NEXT_PUBLIC_` |
 
 ## Security status
 
-MarketMind does **not** currently implement user authentication. Its cloud deployment is therefore appropriate only for a protected personal deployment while in demo/read-only mode.
+MarketMind now fails closed: private routes require a provider-verified identity and an active MarketMind user record. The Admin Console is invite-only and requires TOTP MFA; every owned resource is scoped to the authenticated user and direct-object access attempts return a generic not-found response. The security page includes MFA setup, session visibility, and session revocation. Administrative actions, user/risk changes, broker connection setup, and blocked trade attempts are audited without logging secrets or raw addresses.
 
-**Do not connect live broker credentials to a publicly accessible deployment until authentication is configured.** Live trading remains disabled by default. Production also disables remote paper-order submission by default, even when paper trading is configured.
+**Do not connect broker credentials to a public deployment until you have completed the setup and review checklist.** Remote paper execution is deliberately rejected by this release pending approved OAuth token storage. Live trading remains locked and production rejects `ENABLE_LIVE_TRADING=true`.
 
-Do not commit `.env`, database files, or provider keys. The API returns no secret values to the browser. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for deployment-safe configuration and access guidance.
+Do not commit `.env`, database files, token files, or provider keys. See [docs/SECURITY.md](docs/SECURITY.md) for the threat boundaries and [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for exact Supabase, Vercel, Render, migration, and first-admin setup.
 
 ## Validation
 

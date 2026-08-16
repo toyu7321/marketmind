@@ -1,4 +1,6 @@
 .env
+.env.*
+!.env.example
 *.db
 __pycache__/
 .pytest_cache/
@@ -8,4 +10,10 @@ node_modules/
 *.tsbuildinfo
 coverage/
 *.pyc
+*.log
+*.pem
+*.key
+*.token
+.supabase/
+secrets/
 /.local-verify/

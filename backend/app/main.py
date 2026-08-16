@@ -1,29 +1,35 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import math
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Response, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .account import router as account_router
+from .admin import router as admin_router
 from .backtesting import run_backtest
 from .config import get_settings
-from .database import Prediction, UserSetting, get_db, init_db
+from .database import (
+    BacktestRun, BrokerConnection, PaperOrder, Portfolio, PortfolioPosition, Prediction, SavedStrategy,
+    SystemSetting, UserPreference, UserRiskProfile, UserSetting, get_db, init_db, utcnow,
+)
 from .indicators import technical_snapshot
-from .providers import (
-    COMPANIES, EdgarSECProvider, analyze_evidence, broker_provider, market_provider,
-    news_provider, options_provider, strategy_candidates,
-)
+from .providers import EdgarSECProvider, analyze_evidence, market_provider, news_provider, options_provider, strategy_candidates
 from .risk import RiskLimits, evaluate
-from .schemas import (
-    BacktestRequest, PaperOrderRequest, PredictionCreate, RiskRequest, SettingsUpdate,
-)
+from .schemas import BacktestRequest, PaperOrderRequest, PredictionCreate, RiskRequest, SettingsUpdate
 from .scoring import MARKET_WEIGHTS, STOCK_WEIGHTS, score
+from .security import (
+    Principal, get_owned_resource, rate_limit, require_authenticated_user,
+    require_sensitive_action_auth, trading_allowed, write_audit,
+)
 
 
 @asynccontextmanager
@@ -32,23 +38,36 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="MarketMind API", version="1.1.0", lifespan=lifespan)
+app = FastAPI(title="MarketMind API", version="2.0.0", lifespan=lifespan, docs_url=None if get_settings().is_production else "/docs")
 settings = get_settings()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"], allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "Idempotency-Key", "X-Request-ID"],
+    allow_credentials=False,
 )
 
 
 @app.middleware("http")
-async def security_headers(request, call_next):
+async def security_headers(request: Request, call_next):
     response = await call_next(request)
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()")
+    response.headers.setdefault("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'")
+    if request.url.path.startswith("/api/"):
+        response.headers.setdefault("Cache-Control", "no-store, private, max-age=0")
+        response.headers.setdefault("Pragma", "no-cache")
+    if settings.is_production:
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
     return response
+
+
+app.include_router(admin_router)
+app.include_router(account_router)
+
 
 DEFAULT_USER_SETTINGS: dict[str, Any] = {
     "timezone": "America/New_York",
@@ -75,13 +94,34 @@ def _merge(defaults: dict[str, Any], saved: dict[str, Any] | None) -> dict[str, 
     return result
 
 
-async def runtime_settings(db: AsyncSession) -> dict[str, Any]:
-    row = await db.get(UserSetting, "runtime_settings")
-    return _merge(DEFAULT_USER_SETTINGS, row.value if row else None)
+async def global_defaults(db: AsyncSession) -> dict[str, Any]:
+    # The original `runtime_settings` row is preserved as a backward-compatible global default.
+    legacy = await db.get(UserSetting, "runtime_settings")
+    configured = await db.get(SystemSetting, "runtime_defaults")
+    merged = _merge(DEFAULT_USER_SETTINGS, legacy.value if legacy else None)
+    return _merge(merged, configured.value if configured else None)
+
+
+async def runtime_settings(db: AsyncSession, user_id: str) -> dict[str, Any]:
+    defaults = await global_defaults(db)
+    row = (await db.execute(select(UserPreference).where(UserPreference.user_id == user_id, UserPreference.key == "runtime_settings"))).scalar_one_or_none()
+    return _merge(defaults, row.value if row else None)
+
+
+async def effective_risk_limits(db: AsyncSession, principal: Principal, config: dict[str, Any]) -> RiskLimits:
+    profile = await db.get(UserRiskProfile, principal.user.id)
+    limits = _merge(config["risk"], profile.limits if profile else None)
+    system_security = await db.get(SystemSetting, "security")
+    ceilings = (system_security.value.get("risk_ceiling") if system_security else {}) or {}
+    for key, ceiling in ceilings.items():
+        if ceiling is not None and key in limits and isinstance(limits[key], (int, float)):
+            limits[key] = min(limits[key], ceiling)
+    limits["kill_switch"] = bool(limits.get("kill_switch")) or principal.user.kill_switch_enabled or bool(system_security and system_security.value.get("global_kill_switch"))
+    return RiskLimits(**limits)
 
 
 def _mode(*items: Any) -> str:
-    freshness = []
+    freshness: list[str] = []
     for item in items:
         if isinstance(item, list):
             freshness.extend(str(row.get("freshness", "DEMO")) for row in item)
@@ -109,7 +149,7 @@ def _stock_score(quote: dict[str, Any], tech: dict[str, Any], market_score: int,
         "Volatility": f"Annualized 20-session volatility is {tech['volatility']}%.",
         "Technical Setup": f"Support {tech['support']}; resistance {tech['resistance']}.",
         "Market Environment": f"Deterministic Market Score is {market_score}/100.",
-        "Risk": "Risk engine still has final authority over any proposed order.",
+        "Risk": "Risk engine retains final authority over every order proposal.",
     }
     return score(values, weights, reasons)
 
@@ -124,34 +164,29 @@ def _demo_filings() -> list[dict[str, Any]]:
 
 @app.get("/api/health")
 async def health(response: Response, db: AsyncSession = Depends(get_db)):
-    database = "connected"
+    database = "available"
     try:
         await db.execute(text("SELECT 1"))
     except Exception:
         database = "unavailable"
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
     return {
-        "status": "healthy" if database == "connected" else "degraded",
-        "backend": "online", "database": database,
-        "market_provider": "demo" if settings.demo_mode else "alpaca configured",
-        "ai_provider": "openai enabled" if settings.openai_enabled else "rules fallback",
-        "sec": "configured" if settings.sec_is_configured else "available — configure SEC_USER_AGENT",
-        "broker": "alpaca paper configured" if not settings.demo_mode else "demo paper",
-        "paper_order_submission": "enabled" if settings.paper_order_submission_enabled else "disabled by public-deployment safety",
-        "live_trading": "disabled" if not settings.enable_live_trading else "confirmation required; adapter not installed",
+        "status": "healthy" if database == "available" else "degraded",
+        "database": database,
+        "authentication": "configured" if settings.auth_ready else "not_configured",
+        "live_trading": "locked",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
 @app.get("/api/dashboard")
-async def dashboard(db: AsyncSession = Depends(get_db)):
-    config, provider = await runtime_settings(db), market_provider()
+async def dashboard(principal: Principal = Depends(require_authenticated_user), db: AsyncSession = Depends(get_db)):
+    config, provider = await runtime_settings(db, principal.user.id), market_provider()
     index_symbols = ["SPY", "QQQ", "DIA", "IWM", "VIX"]
     sector_symbols = ["XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLB", "XLRE", "XLU", "XLC", "SMH", "SOXX"]
     quote_symbols = index_symbols + config["watchlist"][2:] + sector_symbols
     quotes, market_status, spy_bars = await asyncio.gather(
-        asyncio.gather(*(provider.get_quote(symbol) for symbol in quote_symbols)),
-        provider.get_market_status(), provider.get_bars("SPY", 240),
+        asyncio.gather(*(provider.get_quote(symbol) for symbol in quote_symbols)), provider.get_market_status(), provider.get_bars("SPY", 240)
     )
     lookup = {quote["symbol"]: quote for quote in quotes}
     spy_tech = technical_snapshot([row["close"] for row in spy_bars], [row["high"] for row in spy_bars], [row["low"] for row in spy_bars], [row["volume"] for row in spy_bars])
@@ -161,27 +196,21 @@ async def dashboard(db: AsyncSession = Depends(get_db)):
     breadth = round(above_ema / len(universe) * 100) if universe else 0
     market_values = {
         "Trend": 84 if spy_tech["trend"] == "bullish" else 38 if spy_tech["trend"] == "bearish" else 55,
-        "Momentum": max(15, min(90, 50 + (spy_tech["rsi"] - 50) * 1.4)),
-        "Breadth": breadth, "Volatility": max(20, min(90, 95 - spy_tech["volatility"] * 1.2)),
-        "Relative Strength": max(20, min(90, 50 + lookup["QQQ"]["change_percent"] * 12)),
-        "Macro": 58, "News": 70,
+        "Momentum": max(15, min(90, 50 + (spy_tech["rsi"] - 50) * 1.4)), "Breadth": breadth,
+        "Volatility": max(20, min(90, 95 - spy_tech["volatility"] * 1.2)),
+        "Relative Strength": max(20, min(90, 50 + lookup["QQQ"]["change_percent"] * 12)), "Macro": 58, "News": 70,
     }
     market = score(market_values, config["market_weights"], {
-        "Trend": f"SPY moving-average alignment is {spy_tech['trend']}.",
-        "Momentum": f"SPY RSI is {spy_tech['rsi']}.",
+        "Trend": f"SPY moving-average alignment is {spy_tech['trend']}.", "Momentum": f"SPY RSI is {spy_tech['rsi']}.",
         "Breadth": f"{breadth}% of the configured watch universe is participating.",
         "Volatility": f"Annualized rolling volatility is {spy_tech['volatility']}%.",
-        "Macro": "No external macro feed is configured; neutral default applied.",
-        "News": "News contribution is deterministic until a connected feed is available.",
+        "Macro": "No external macro feed is configured; neutral default applied.", "News": "News contribution is deterministic until a connected feed is available.",
     })
     analysis = await analyze_evidence({"score": market.score, "trend": spy_tech["trend"], "breadth": breadth, "volatility": spy_tech["volatility"]})
-    sectors = []
-    for symbol in sector_symbols:
-        quote = lookup[symbol]
-        sectors.append({
-            "symbol": symbol, "name": {"XLK": "Technology", "XLF": "Financials", "XLE": "Energy", "XLV": "Healthcare", "SMH": "Semiconductors", "SOXX": "Semiconductors"}.get(symbol, symbol),
-            "change": quote["change_percent"], "relative_strength": round(max(0, min(100, 50 + quote["change_percent"] * 15)), 1), "freshness": quote["freshness"],
-        })
+    sectors = [{
+        "symbol": symbol, "name": {"XLK": "Technology", "XLF": "Financials", "XLE": "Energy", "XLV": "Healthcare", "SMH": "Semiconductors", "SOXX": "Semiconductors"}.get(symbol, symbol),
+        "change": lookup[symbol]["change_percent"], "relative_strength": round(max(0, min(100, 50 + lookup[symbol]["change_percent"] * 15)), 1), "freshness": lookup[symbol]["freshness"],
+    } for symbol in sector_symbols]
     return {
         "mode": _mode(quotes, market_status), "status": market_status, "market_score": market,
         "indices": [lookup[symbol] for symbol in index_symbols], "watchlist": [lookup[symbol] for symbol in config["watchlist"][2:] if symbol in lookup],
@@ -191,8 +220,8 @@ async def dashboard(db: AsyncSession = Depends(get_db)):
 
 
 @app.get("/api/scanner")
-async def scanner(db: AsyncSession = Depends(get_db)):
-    config, provider = await runtime_settings(db), market_provider()
+async def scanner(principal: Principal = Depends(require_authenticated_user), db: AsyncSession = Depends(get_db)):
+    config, provider = await runtime_settings(db, principal.user.id), market_provider()
     symbols = list(dict.fromkeys(config["watchlist"][2:] + ["JPM", "XOM", "LLY", "AVGO", "NFLX", "COST"]))
     quotes = await asyncio.gather(*(provider.get_quote(symbol) for symbol in symbols))
     output = []
@@ -200,208 +229,226 @@ async def scanner(db: AsyncSession = Depends(get_db)):
         bars = await provider.get_bars(quote["symbol"], 90)
         tech = technical_snapshot([row["close"] for row in bars], [row["high"] for row in bars], [row["low"] for row in bars], [row["volume"] for row in bars])
         result = _stock_score(quote, tech, 70, config["stock_weights"])
-        output.append({
-            **quote, **tech, "score": result.score, "five_day": round((bars[-1]["close"] / bars[-6]["close"] - 1) * 100, 2),
-            "momentum": "High" if result.score >= 70 else "Medium" if result.score >= 50 else "Low",
-            "relative_strength": round(max(0, min(100, result.score * 0.92)), 1),
-            "news_sentiment": "Positive" if quote["change_percent"] > 0 else "Neutral",
-            "ai_confidence": min(88, result.confidence), "freshness": _mode(quote, bars),
-        })
+        output.append({**quote, **tech, "score": result.score, "five_day": round((bars[-1]["close"] / bars[-6]["close"] - 1) * 100, 2), "momentum": "High" if result.score >= 70 else "Medium" if result.score >= 50 else "Low", "relative_strength": round(max(0, min(100, result.score * 0.92)), 1), "news_sentiment": "Positive" if quote["change_percent"] > 0 else "Neutral", "ai_confidence": min(88, result.confidence), "freshness": _mode(quote, bars)})
     return {"mode": _mode(output), "results": sorted(output, key=lambda row: row["score"], reverse=True)}
 
 
 @app.get("/api/stocks/{symbol}")
-async def stock(symbol: str, db: AsyncSession = Depends(get_db)):
+async def stock(symbol: str, principal: Principal = Depends(require_authenticated_user), db: AsyncSession = Depends(get_db)):
     symbol = symbol.upper()
     if not symbol.isalnum() or len(symbol) > 8:
-        raise HTTPException(status_code=400, detail="Invalid symbol")
-    config, provider = await runtime_settings(db), market_provider()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid symbol")
+    config, provider = await runtime_settings(db, principal.user.id), market_provider()
     quote, bars = await asyncio.gather(provider.get_quote(symbol), provider.get_bars(symbol, 240))
     tech = technical_snapshot([row["close"] for row in bars], [row["high"] for row in bars], [row["low"] for row in bars], [row["volume"] for row in bars])
     result = _stock_score(quote, tech, 70, config["stock_weights"])
-    analysis = await analyze_evidence({
-        "ticker": symbol, "stock_score": result.score, "rsi": tech["rsi"], "macd": tech["macd"],
-        "trend": tech["trend"], "relative_strength": "strong" if result.score >= 70 else "mixed", "risk_events": [],
-    })
+    analysis = await analyze_evidence({"ticker": symbol, "stock_score": result.score, "rsi": tech["rsi"], "macd": tech["macd"], "trend": tech["trend"], "relative_strength": "strong" if result.score >= 70 else "mixed", "risk_events": []})
     filings = await EdgarSECProvider().filings_for_symbol(symbol)
-    mode = _mode(quote, bars, filings)
-    news = [{
-        "time": "14:32", "headline": f"{quote['company']} remains in focus as investors assess sector momentum",
-        "tickers": [symbol], "sector": "Technology", "sentiment": "Positive", "importance": "High",
-        "why": "Demo context is shown until a connected ticker-news feed returns related articles.", "freshness": "DEMO",
-    }]
-    return {
-        "mode": mode, "quote": quote, "bars": bars, "technical": tech, "score": result, "analysis": analysis,
-        "outlooks": [{"horizon": days, "bull": min(70, result.score - 8 + days), "neutral": 25, "bear": max(5, 83 - result.score - days), "confidence": min(82, result.confidence - days)} for days in (1, 3, 5)],
-        "news": news, "filings": filings or _demo_filings(),
-        "fundamentals": {"revenue": "$130.5B", "revenue_growth": "+34.2%", "eps": "$4.18", "gross_margin": "71.3%", "forward_pe": "31.8x", "trend": "Improving", "freshness": "DEMO"},
-    }
+    news = [{"time": "14:32", "headline": f"{quote['company']} remains in focus as investors assess sector momentum", "tickers": [symbol], "sector": "Technology", "sentiment": "Positive", "importance": "High", "why": "Demo context is shown until a connected ticker-news feed returns related articles.", "freshness": "DEMO"}]
+    return {"mode": _mode(quote, bars, filings), "quote": quote, "bars": bars, "technical": tech, "score": result, "analysis": analysis, "outlooks": [{"horizon": days, "bull": min(70, result.score - 8 + days), "neutral": 25, "bear": max(5, 83 - result.score - days), "confidence": min(82, result.confidence - days)} for days in (1, 3, 5)], "news": news, "filings": filings or _demo_filings(), "fundamentals": {"revenue": "$130.5B", "revenue_growth": "+34.2%", "eps": "$4.18", "gross_margin": "71.3%", "forward_pe": "31.8x", "trend": "Improving", "freshness": "DEMO"}}
 
 
 @app.get("/api/news")
-async def news(db: AsyncSession = Depends(get_db)):
-    config = await runtime_settings(db)
+async def news(principal: Principal = Depends(require_authenticated_user), db: AsyncSession = Depends(get_db)):
+    config = await runtime_settings(db, principal.user.id)
     mode, items = await news_provider().get_news(config["watchlist"])
     return {"mode": mode, "items": items}
 
 
 @app.get("/api/options/{symbol}")
-async def options(symbol: str):
+async def options(symbol: str, _: Principal = Depends(require_authenticated_user)):
     symbol = symbol.upper()
+    if not symbol.isalnum() or len(symbol) > 8:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid symbol")
     quote = await market_provider().get_quote(symbol)
     source, chain = await options_provider().get_chain(symbol, quote["price"])
     valid_iv = [row["iv"] for row in chain if row.get("iv") is not None]
     call_volume = sum(row.get("volume") or 0 for row in chain if row["type"] == "CALL")
     put_volume = sum(row.get("volume") or 0 for row in chain if row["type"] == "PUT")
-    return {
-        "mode": source, "symbol": symbol, "spot": quote["price"], "put_call_ratio": round(put_volume / call_volume, 2) if call_volume else None,
-        "iv_rank": round(sum(valid_iv) / len(valid_iv), 1) if valid_iv else None, "chain": chain,
-        "strategies": strategy_candidates(quote["price"], chain),
-    }
+    return {"mode": source, "symbol": symbol, "spot": quote["price"], "put_call_ratio": round(put_volume / call_volume, 2) if call_volume else None, "iv_rank": round(sum(valid_iv) / len(valid_iv), 1) if valid_iv else None, "chain": chain, "strategies": strategy_candidates(quote["price"], chain)}
 
 
-@app.post("/api/risk/evaluate")
-async def risk_evaluate(req: RiskRequest, db: AsyncSession = Depends(get_db)):
-    config = await runtime_settings(db)
-    return evaluate(req, RiskLimits(**config["risk"]))
+@app.post("/api/risk/evaluate", dependencies=[Depends(rate_limit("risk", 30))])
+async def risk_evaluate(req: RiskRequest, principal: Principal = Depends(require_authenticated_user), db: AsyncSession = Depends(get_db)):
+    config = await runtime_settings(db, principal.user.id)
+    return evaluate(req, await effective_risk_limits(db, principal, config))
 
 
-@app.post("/api/backtest")
-async def backtest(req: BacktestRequest):
+@app.post("/api/backtest", dependencies=[Depends(rate_limit("backtest", 12))])
+async def backtest(req: BacktestRequest, principal: Principal = Depends(require_authenticated_user), db: AsyncSession = Depends(get_db)):
     bars = await market_provider().get_bars(req.ticker.upper(), req.days)
     prices = [row["close"] for row in bars]
     scores = [int(62 + 18 * math.sin(index / 17) + 8 * math.sin(index / 5)) for index in range(len(prices))]
-    return {
-        "ticker": req.ticker.upper(), "mode": _mode(bars), "strategy": "MarketMind score threshold (next-session execution)",
-        **run_backtest(prices, scores, req.score_threshold, req.transaction_cost_bps, [row["time"] for row in bars]),
-    }
+    result = {"ticker": req.ticker.upper(), "mode": _mode(bars), "strategy": "MarketMind score threshold (next-session execution)", **run_backtest(prices, scores, req.score_threshold, req.transaction_cost_bps, [row["time"] for row in bars])}
+    db.add(BacktestRun(user_id=principal.user.id, parameters=req.model_dump(), result=result))
+    await db.commit()
+    return result
 
 
-async def evaluate_expired_predictions(db: AsyncSession) -> None:
+async def evaluate_expired_predictions(db: AsyncSession, user_id: str) -> None:
     cutoff = datetime.now(timezone.utc)
-    rows = (await db.execute(select(Prediction).where(Prediction.actual_return.is_(None)))).scalars().all()
+    rows = (await db.execute(select(Prediction).where(Prediction.user_id == user_id, Prediction.actual_return.is_(None)))).scalars().all()
     provider = market_provider()
     for row in rows:
-        if cutoff < row.created_at.replace(tzinfo=timezone.utc) + timedelta(days=row.horizon * 2):
+        created_at = row.created_at.replace(tzinfo=timezone.utc) if row.created_at.tzinfo is None else row.created_at
+        if cutoff < created_at + timedelta(days=row.horizon * 2):
             continue
         quote = await provider.get_quote(row.ticker)
         actual_return = round((quote["price"] / row.starting_price - 1) * 100, 2)
-        row.actual_return = actual_return
-        row.direction_correct = (row.bias.lower().startswith("bull") and actual_return > 0) or (row.bias.lower().startswith("bear") and actual_return < 0) or (row.bias.lower().startswith("neutral") and abs(actual_return) < 1)
-        row.invalidation_triggered = abs(actual_return) > 8
-        row.evaluated_at = cutoff
+        row.actual_return, row.direction_correct, row.invalidation_triggered, row.evaluated_at = actual_return, ((row.bias.lower().startswith("bull") and actual_return > 0) or (row.bias.lower().startswith("bear") and actual_return < 0) or (row.bias.lower().startswith("neutral") and abs(actual_return) < 1)), abs(actual_return) > 8, cutoff
     if rows:
         await db.commit()
 
 
 @app.get("/api/predictions")
-async def predictions(db: AsyncSession = Depends(get_db)):
-    await evaluate_expired_predictions(db)
-    rows = (await db.execute(select(Prediction).order_by(Prediction.created_at.desc()))).scalars().all()
-    stored = [{
-        "ticker": row.ticker, "horizon": row.horizon, "bias": row.bias, "confidence": row.confidence,
-        "starting_price": row.starting_price, "actual_return": row.actual_return, "direction_correct": row.direction_correct,
-        "evaluated_at": row.evaluated_at.isoformat() if row.evaluated_at else None,
-    } for row in rows]
-    demo = [
-        {"ticker": "NVDA", "horizon": 3, "bias": "Bullish", "confidence": 72, "starting_price": 178.2, "actual_return": 2.4, "direction_correct": True},
-        {"ticker": "AMD", "horizon": 5, "bias": "Bullish", "confidence": 68, "starting_price": 169.8, "actual_return": -1.1, "direction_correct": False},
-        {"ticker": "SPY", "horizon": 1, "bias": "Neutral", "confidence": 61, "starting_price": 641.3, "actual_return": 0.3, "direction_correct": True},
-    ]
-    completed = [item for item in stored if item["actual_return"] is not None] + demo
+async def predictions(principal: Principal = Depends(require_authenticated_user), db: AsyncSession = Depends(get_db)):
+    await evaluate_expired_predictions(db, principal.user.id)
+    rows = (await db.execute(select(Prediction).where(Prediction.user_id == principal.user.id).order_by(Prediction.created_at.desc()))).scalars().all()
+    stored = [{"id": row.public_id, "ticker": row.ticker, "horizon": row.horizon, "bias": row.bias, "confidence": row.confidence, "starting_price": row.starting_price, "actual_return": row.actual_return, "direction_correct": row.direction_correct, "evaluated_at": row.evaluated_at.isoformat() if row.evaluated_at else None} for row in rows]
+    completed = [item for item in stored if item["actual_return"] is not None]
     accuracy = round(sum(bool(item.get("direction_correct")) for item in completed) / len(completed) * 100, 1) if completed else 0
-    return {"mode": "MIXED" if stored else "DEMO", "accuracy": accuracy, "average_return": round(sum(item["actual_return"] for item in completed) / len(completed), 2) if completed else 0, "by_horizon": {"1D": 64, "3D": 71, "5D": 68}, "predictions": stored + demo}
+    return {"mode": "USER", "accuracy": accuracy, "average_return": round(sum(item["actual_return"] for item in completed) / len(completed), 2) if completed else 0, "by_horizon": {"1D": 0, "3D": 0, "5D": 0}, "predictions": stored}
 
 
-@app.post("/api/predictions", status_code=status.HTTP_201_CREATED)
-async def create_prediction(req: PredictionCreate, db: AsyncSession = Depends(get_db)):
-    row = Prediction(
-        ticker=req.ticker.upper(), horizon=req.horizon, bias=req.bias,
-        probabilities={"bull": req.bull_probability, "neutral": req.neutral_probability, "bear": req.bear_probability},
-        confidence=req.confidence, starting_price=req.starting_price, stock_score=req.stock_score, market_score=req.market_score,
-    )
+@app.post("/api/predictions", status_code=status.HTTP_201_CREATED, dependencies=[Depends(rate_limit("predictions", 20))])
+async def create_prediction(req: PredictionCreate, request: Request, principal: Principal = Depends(require_authenticated_user), db: AsyncSession = Depends(get_db)):
+    row = Prediction(user_id=principal.user.id, ticker=req.ticker.upper(), horizon=req.horizon, bias=req.bias, probabilities={"bull": req.bull_probability, "neutral": req.neutral_probability, "bear": req.bear_probability}, confidence=req.confidence, starting_price=req.starting_price, stock_score=req.stock_score, market_score=req.market_score)
     db.add(row)
+    await db.flush()
+    await write_audit(db, request, event_type="PREDICTION_CREATED", user_id=principal.user.id, resource=f"predictions/{row.public_id}")
     await db.commit()
-    await db.refresh(row)
-    return {"id": row.id, "status": "tracked"}
+    return {"id": row.public_id, "status": "tracked"}
+
+
+@app.get("/api/predictions/{prediction_id}")
+async def prediction_detail(prediction_id: str, principal: Principal = Depends(require_authenticated_user), db: AsyncSession = Depends(get_db)):
+    row = (await db.execute(select(Prediction).where(Prediction.public_id == prediction_id, Prediction.user_id == principal.user.id))).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resource not found.")
+    return {"id": row.public_id, "ticker": row.ticker, "horizon": row.horizon, "bias": row.bias, "probabilities": row.probabilities, "confidence": row.confidence}
+
+
+async def _personal_portfolio(db: AsyncSession, user_id: str) -> Portfolio:
+    row = (await db.execute(select(Portfolio).where(Portfolio.user_id == user_id, Portfolio.name == "Personal portfolio"))).scalar_one_or_none()
+    if row is None:
+        row = Portfolio(user_id=user_id, name="Personal portfolio")
+        db.add(row)
+        await db.flush()
+        await db.commit()
+    return row
 
 
 @app.get("/api/portfolio")
-async def portfolio():
-    broker = broker_provider()
-    account, positions, orders = await asyncio.gather(broker.account(), broker.positions(), broker.orders())
+async def portfolio(principal: Principal = Depends(require_authenticated_user), db: AsyncSession = Depends(get_db)):
+    account = await _personal_portfolio(db, principal.user.id)
+    positions = (await db.execute(select(PortfolioPosition).where(PortfolioPosition.portfolio_id == account.id))).scalars().all()
+    provider = market_provider()
+    output = []
     for row in positions:
-        row.setdefault("market_value", round(row["quantity"] * row["price"], 2))
-        row.setdefault("unrealized_pl", round(row["quantity"] * (row["price"] - row["average_cost"]), 2))
-        row.setdefault("daily_pl", round(row["quantity"] * row["price"] * 0.006, 2))
-    total_positions = sum(row["market_value"] for row in positions)
-    for row in positions:
-        row["weight"] = round(row["market_value"] / total_positions * 100, 1) if total_positions else 0
-    equity = float(account["equity"])
-    return {
-        "mode": account["mode"], "source": account["source"], "equity": equity, "cash": account["cash"], "buying_power": account["buying_power"],
-        "exposure": round(total_positions / equity * 100, 1) if equity else 0, "positions": positions, "orders": orders,
-        "equity_curve": [round(equity * (0.965 + index * 0.001 + math.sin(index / 3) * 0.012), 2) for index in range(40)],
-    }
+        quote = await provider.get_quote(row.symbol)
+        value = round(row.quantity * quote["price"], 2)
+        output.append({"symbol": row.symbol, "quantity": row.quantity, "average_cost": row.average_cost, "price": quote["price"], "market_value": value, "unrealized_pl": round(row.quantity * (quote["price"] - row.average_cost), 2), "daily_pl": round(row.quantity * quote["change"], 2), "sector": row.sector})
+    total_positions = sum(row["market_value"] for row in output)
+    for row in output:
+        row["weight"] = round(row["market_value"] / (account.cash + total_positions) * 100, 1) if account.cash + total_positions else 0
+    return {"mode": "USER", "source": "Manual portfolio", "equity": round(account.cash + total_positions, 2), "cash": account.cash, "buying_power": account.cash, "exposure": round(total_positions / (account.cash + total_positions) * 100, 1) if account.cash + total_positions else 0, "positions": output, "orders": [], "equity_curve": []}
+
+
+@app.get("/api/portfolios/{portfolio_id}")
+async def portfolio_detail(portfolio_id: str, principal: Principal = Depends(require_authenticated_user), db: AsyncSession = Depends(get_db)):
+    row = await get_owned_resource(db, Portfolio, portfolio_id, principal.user.id)
+    positions = (await db.execute(select(PortfolioPosition).where(PortfolioPosition.portfolio_id == row.id))).scalars().all()
+    return {"id": row.id, "name": row.name, "cash": row.cash, "positions": [{"symbol": position.symbol, "quantity": position.quantity, "average_cost": position.average_cost} for position in positions]}
+
+
+@app.get("/api/backtests/{backtest_id}")
+async def backtest_detail(backtest_id: str, principal: Principal = Depends(require_authenticated_user), db: AsyncSession = Depends(get_db)):
+    row = await get_owned_resource(db, BacktestRun, backtest_id, principal.user.id)
+    return {"id": row.id, "parameters": row.parameters, "result": row.result}
+
+
+@app.get("/api/strategies/{strategy_id}")
+async def strategy_detail(strategy_id: str, principal: Principal = Depends(require_authenticated_user), db: AsyncSession = Depends(get_db)):
+    row = await get_owned_resource(db, SavedStrategy, strategy_id, principal.user.id)
+    return {"id": row.id, "name": row.name, "configuration": row.configuration}
+
+
+@app.get("/api/trading/orders/{order_id}")
+async def paper_order_detail(order_id: str, principal: Principal = Depends(require_authenticated_user), db: AsyncSession = Depends(get_db)):
+    row = await get_owned_resource(db, PaperOrder, order_id, principal.user.id)
+    return {"id": row.id, "status": row.status, "created_at": row.created_at.isoformat()}
 
 
 def _order_risk_request(order: PaperOrderRequest, equity: float) -> RiskRequest:
-    return RiskRequest(
-        symbol=order.symbol.upper(), proposed_value=order.quantity * (order.limit_price or order.estimated_price),
-        portfolio_equity=equity, current_exposure=order.current_exposure, sector_exposure=order.sector_exposure,
-        daily_pnl=order.daily_pnl, liquidity=order.liquidity, event_risk=order.event_risk,
-    )
+    return RiskRequest(symbol=order.symbol.upper(), proposed_value=order.quantity * (order.limit_price or order.estimated_price), portfolio_equity=equity, current_exposure=order.current_exposure, sector_exposure=order.sector_exposure, daily_pnl=order.daily_pnl, liquidity=order.liquidity, event_risk=order.event_risk)
 
 
-@app.post("/api/trading/preview")
-async def preview_paper_order(order: PaperOrderRequest, db: AsyncSession = Depends(get_db)):
-    config, account = await runtime_settings(db), await broker_provider().account()
-    decision = evaluate(_order_risk_request(order, float(account["equity"])), RiskLimits(**config["risk"]))
-    return {"mode": "PAPER", "order": order.model_dump(exclude={"confirmed"}), "risk": decision, "requires_confirmation": decision["decision"] == "APPROVED"}
+@app.post("/api/trading/preview", dependencies=[Depends(rate_limit("order_preview", 10))])
+async def preview_paper_order(order: PaperOrderRequest, principal: Principal = Depends(require_authenticated_user), db: AsyncSession = Depends(get_db)):
+    config = await runtime_settings(db, principal.user.id)
+    portfolio_row = await _personal_portfolio(db, principal.user.id)
+    decision = evaluate(_order_risk_request(order, portfolio_row.cash), await effective_risk_limits(db, principal, config))
+    return {"mode": "PAPER", "order": order.model_dump(exclude={"confirmed"}), "risk": decision, "requires_confirmation": decision["decision"] == "APPROVED", "execution": "disabled until a user-owned OAuth broker connection is activated"}
 
 
-@app.post("/api/trading/orders")
-async def submit_paper_order(order: PaperOrderRequest, db: AsyncSession = Depends(get_db)):
-    if not settings.paper_order_submission_enabled:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Paper order submission is disabled in production until authentication is configured.")
+@app.post("/api/trading/orders", dependencies=[Depends(rate_limit("order_submit", 5))])
+async def submit_paper_order(order: PaperOrderRequest, request: Request, idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=16, max_length=128), principal: Principal = Depends(require_sensitive_action_auth), db: AsyncSession = Depends(get_db)):
+    await trading_allowed(db, principal)
     if not order.confirmed:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Explicit confirmation is required before a paper order is submitted.")
-    preview = await preview_paper_order(order, db)
-    if preview["risk"]["decision"] != "APPROVED":
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"risk": preview["risk"]})
-    try:
-        result = await broker_provider().submit_order(preview["order"])
-    except RuntimeError as error:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(error)) from error
-    return {"mode": "PAPER", "risk": preview["risk"], **result}
+    existing = (await db.execute(select(PaperOrder).where(PaperOrder.user_id == principal.user.id, PaperOrder.idempotency_key == idempotency_key))).scalar_one_or_none()
+    if existing:
+        return {"id": existing.id, "status": existing.status, "idempotent_replay": True}
+    connection = (await db.execute(select(BrokerConnection).where(BrokerConnection.user_id == principal.user.id, BrokerConnection.provider == "alpaca", BrokerConnection.environment == "paper", BrokerConnection.status == "ACTIVE"))).scalar_one_or_none()
+    payload = order.model_dump()
+    preview_hash = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    if connection is None:
+        row = PaperOrder(user_id=principal.user.id, idempotency_key=idempotency_key, payload=payload, preview_hash=preview_hash, status="REJECTED")
+        db.add(row)
+        await write_audit(db, request, event_type="PAPER_ORDER_REJECTED", user_id=principal.user.id, resource="trading/orders", result="DENIED", safe_metadata={"reason": "no_active_user_broker_connection"})
+        await db.commit()
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No active user-owned paper broker connection is available.")
+    # OAuth token exchange and execution are intentionally not activated in this security foundation.
+    row = PaperOrder(user_id=principal.user.id, broker_connection_id=connection.id, idempotency_key=idempotency_key, payload=payload, preview_hash=preview_hash, status="REJECTED")
+    db.add(row)
+    await write_audit(db, request, event_type="PAPER_ORDER_REJECTED", user_id=principal.user.id, resource="trading/orders", result="DENIED", safe_metadata={"reason": "oauth_execution_not_activated"})
+    await db.commit()
+    raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Broker order execution is not activated. MarketMind is operating in secure preview-only mode.")
 
 
 @app.get("/api/settings")
-async def get_settings_endpoint(db: AsyncSession = Depends(get_db)):
-    config = await runtime_settings(db)
-    return {
-        **config,
-        "providers": {
-            "Market Data": "Demo" if settings.demo_mode else "Alpaca configured",
-            "News": "Demo" if settings.demo_mode else "Alpaca configured",
-            "OpenAI": "Connected" if settings.openai_enabled else "Offline (rules fallback)",
-            "SEC": "Configured" if settings.sec_is_configured else "Available — configure User-Agent",
-            "Broker": "Demo Paper" if settings.demo_mode else "Alpaca Paper configured",
-            "Paper order submission": "Enabled" if settings.paper_order_submission_enabled else "Disabled in production until authentication is configured",
-            "Live Trading": "Disabled",
-        },
-    }
+async def get_settings_endpoint(principal: Principal = Depends(require_authenticated_user), db: AsyncSession = Depends(get_db)):
+    config = await runtime_settings(db, principal.user.id)
+    security = await db.get(SystemSetting, "security")
+    return {**config, "providers": {"Market Data": "Demo" if settings.demo_mode else "Alpaca configured", "News": "Demo" if settings.demo_mode else "Alpaca configured", "OpenAI": "Connected" if settings.openai_enabled else "Offline (rules fallback)", "SEC": "Configured" if settings.sec_is_configured else "Available", "Broker": "Not connected", "Paper order submission": "Disabled until OAuth connection activation", "Live Trading": "Locked"}, "security": {"global_kill_switch": bool(security and security.value.get("global_kill_switch")), "user_kill_switch": principal.user.kill_switch_enabled, "mfa_level": principal.aal}}
 
 
-@app.put("/api/settings")
-async def update_settings(payload: SettingsUpdate, db: AsyncSession = Depends(get_db)):
-    current = await runtime_settings(db)
+@app.put("/api/settings", dependencies=[Depends(rate_limit("settings", 20))])
+async def update_settings(payload: SettingsUpdate, request: Request, principal: Principal = Depends(require_authenticated_user), db: AsyncSession = Depends(get_db)):
+    current = await runtime_settings(db, principal.user.id)
     update = payload.model_dump(exclude_none=True)
+    for name, allowed in (("market_weights", set(MARKET_WEIGHTS)), ("stock_weights", set(STOCK_WEIGHTS))):
+        if name in update and set(update[name]) != allowed:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"{name} keys must match the configured scoring framework")
+    for nested in ("risk", "automation", "ai"):
+        if nested in update:
+            update[nested] = {key: value for key, value in update[nested].items() if value is not None}
     merged = _merge(current, update)
-    row = await db.get(UserSetting, "runtime_settings")
+    row = (await db.execute(select(UserPreference).where(UserPreference.user_id == principal.user.id, UserPreference.key == "runtime_settings"))).scalar_one_or_none()
     if row:
         row.value = merged
     else:
-        db.add(UserSetting(key="runtime_settings", value=merged))
+        db.add(UserPreference(user_id=principal.user.id, key="runtime_settings", value=merged))
+    if "risk" in update:
+        profile_limits = {key: value for key, value in update["risk"].items() if key != "kill_switch"}
+        profile = await db.get(UserRiskProfile, principal.user.id)
+        if profile:
+            profile.limits = {**profile.limits, **profile_limits}
+        else:
+            db.add(UserRiskProfile(user_id=principal.user.id, limits=profile_limits))
+    if "risk" in update and "kill_switch" in update["risk"]:
+        principal.user.kill_switch_enabled = bool(update["risk"]["kill_switch"])
+        await write_audit(db, request, event_type="KILL_SWITCH_TRIGGERED" if principal.user.kill_switch_enabled else "KILL_SWITCH_RELEASED", user_id=principal.user.id, resource="settings/risk")
+    await write_audit(db, request, event_type="RISK_SETTING_CHANGED" if "risk" in update else "SETTINGS_CHANGED", user_id=principal.user.id, resource="settings", safe_metadata={"sections": sorted(update)})
     await db.commit()
     return {"status": "saved", "settings": merged}
