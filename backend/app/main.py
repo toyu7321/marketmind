@@ -24,7 +24,7 @@ from .database import (
 from .indicators import technical_snapshot
 from .providers import EdgarSECProvider, analyze_evidence, market_provider, news_provider, options_provider, strategy_candidates
 from .risk import RiskLimits, evaluate
-from .schemas import BacktestRequest, PaperOrderRequest, PredictionCreate, RiskRequest, SettingsUpdate
+from .schemas import BacktestRequest, PaperOrderRequest, PortfolioResponse, PredictionCreate, RiskRequest, SettingsUpdate
 from .scoring import MARKET_WEIGHTS, STOCK_WEIGHTS, score
 from .security import (
     Principal, get_owned_resource, rate_limit, require_authenticated_user,
@@ -338,20 +338,42 @@ async def _personal_portfolio(db: AsyncSession, user_id: str) -> Portfolio:
     return row
 
 
-@app.get("/api/portfolio")
+def _portfolio_number(value: Any, fallback: float = 0.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    return number if math.isfinite(number) else fallback
+
+
+@app.get("/api/portfolio", response_model=PortfolioResponse)
 async def portfolio(principal: Principal = Depends(require_authenticated_user), db: AsyncSession = Depends(get_db)):
     account = await _personal_portfolio(db, principal.user.id)
     positions = (await db.execute(select(PortfolioPosition).where(PortfolioPosition.portfolio_id == account.id))).scalars().all()
     provider = market_provider()
-    output = []
+    output: list[dict[str, Any]] = []
     for row in positions:
-        quote = await provider.get_quote(row.symbol)
-        value = round(row.quantity * quote["price"], 2)
-        output.append({"symbol": row.symbol, "quantity": row.quantity, "average_cost": row.average_cost, "price": quote["price"], "market_value": value, "unrealized_pl": round(row.quantity * (quote["price"] - row.average_cost), 2), "daily_pl": round(row.quantity * quote["change"], 2), "sector": row.sector})
+        symbol = str(row.symbol or "").strip().upper()
+        if not symbol:
+            continue
+        quantity = _portfolio_number(row.quantity)
+        average_cost = _portfolio_number(row.average_cost)
+        try:
+            quote = await provider.get_quote(symbol)
+        except Exception:
+            quote = {}
+        quote = quote if isinstance(quote, dict) else {}
+        price = _portfolio_number(quote.get("price"), average_cost)
+        daily_change = _portfolio_number(quote.get("change"))
+        value = round(quantity * price, 2)
+        output.append({"symbol": symbol, "quantity": quantity, "average_cost": average_cost, "price": price, "market_value": value, "unrealized_pl": round(quantity * (price - average_cost), 2), "daily_pl": round(quantity * daily_change, 2), "sector": str(row.sector or "Unknown")})
     total_positions = sum(row["market_value"] for row in output)
+    cash = _portfolio_number(account.cash)
+    total_value = round(cash + total_positions, 2)
     for row in output:
-        row["weight"] = round(row["market_value"] / (account.cash + total_positions) * 100, 1) if account.cash + total_positions else 0
-    return {"mode": "USER", "source": "Manual portfolio", "equity": round(account.cash + total_positions, 2), "cash": account.cash, "buying_power": account.cash, "exposure": round(total_positions / (account.cash + total_positions) * 100, 1) if account.cash + total_positions else 0, "positions": output, "orders": [], "equity_curve": []}
+        row["weight"] = round(row["market_value"] / total_value * 100, 1) if total_value else 0
+    allocation = [{"symbol": row["symbol"], "sector": row["sector"], "market_value": row["market_value"], "weight": row["weight"]} for row in output]
+    return {"mode": "USER", "source": "Manual portfolio", "equity": total_value, "total_value": total_value, "cash": cash, "buying_power": cash, "exposure": round(total_positions / total_value * 100, 1) if total_value else 0, "day_change": round(sum(row["daily_pl"] for row in output), 2), "positions": output, "allocation": allocation, "orders": [], "equity_curve": []}
 
 
 @app.get("/api/portfolios/{portfolio_id}")

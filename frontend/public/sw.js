@@ -1,5 +1,5 @@
 /* MarketMind worker: cache only public static assets, never authenticated screens or API data. */
-const VERSION = 'marketmind-shell-v3';
+const VERSION = 'marketmind-shell-v4';
 const SHELL = [
   '/offline', '/manifest.webmanifest',
   '/icons/marketmind.svg', '/icons/marketmind-maskable.svg',
@@ -31,10 +31,16 @@ self.addEventListener('fetch', event => {
     event.respondWith(fetch(request).catch(async () => (await caches.match('/offline')) || Response.error()));
     return;
   }
-  const safeStatic = url.pathname.startsWith('/_next/static/') || url.pathname.startsWith('/icons/') || url.pathname === '/manifest.webmanifest';
+  const safeStatic = url.pathname.startsWith('/_next/static/') || url.pathname.startsWith('/icons/') || url.pathname === '/manifest.webmanifest' || url.pathname === '/favicon.ico';
   if (!safeStatic) return;
   event.respondWith(caches.match(request).then(cached => cached || fetch(request).then(response => {
-    if (response && response.ok) caches.open(VERSION).then(cache => cache.put(request, response.clone()));
+    if (response && response.ok) {
+      // Clone synchronously, before returning the original response to the
+      // browser. Deferring clone() until caches.open() resolves races with the
+      // browser consuming that original body and causes a used-body failure.
+      const cacheCopy = response.clone();
+      event.waitUntil(caches.open(VERSION).then(cache => cache.put(request, cacheCopy)).catch(() => undefined));
+    }
     return response;
   }).catch(() => Response.error())));
 });

@@ -13,6 +13,7 @@ from app.database import (
     BrokerConnection,
     PaperOrder,
     Portfolio,
+    PortfolioPosition,
     SavedStrategy,
     Session,
     SystemSetting,
@@ -20,6 +21,7 @@ from app.database import (
 )
 from app.config import Settings
 from app.main import app
+import app.main as main_module
 import app.security as security_module
 from app.security import Principal, rate_limiter, require_authenticated_user
 
@@ -120,6 +122,69 @@ def test_idor_attempts_return_not_found_for_every_owned_resource_type():
     with authenticated_client(_principal(attacker)) as client:
         for path in paths:
             assert client.get(path).status_code == 404
+
+
+def test_new_user_portfolio_has_a_stable_zero_holdings_contract():
+    user = asyncio.run(_create_user(role="ADMIN"))
+    with authenticated_client(_principal(user)) as client:
+        response = client.get("/api/portfolio")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["mode"] == "USER"
+    assert payload["positions"] == []
+    assert payload["allocation"] == []
+    assert payload["orders"] == []
+    assert payload["equity_curve"] == []
+    assert payload["day_change"] == 0
+    assert payload["total_value"] == payload["equity"] == payload["cash"]
+
+
+def test_personal_portfolios_are_scoped_to_the_authenticated_user():
+    owner, other = asyncio.run(_create_user()), asyncio.run(_create_user())
+
+    async def seed_owner_position():
+        async with Session() as db:
+            portfolio = Portfolio(user_id=owner.id, name="Personal portfolio", cash=10_000)
+            db.add(portfolio)
+            await db.flush()
+            db.add(PortfolioPosition(portfolio_id=portfolio.id, symbol="NVDA", quantity=2, average_cost=100, sector="Technology"))
+            await db.commit()
+
+    asyncio.run(seed_owner_position())
+    with authenticated_client(_principal(owner)) as client:
+        owner_portfolio = client.get("/api/portfolio")
+    with authenticated_client(_principal(other)) as client:
+        other_portfolio = client.get("/api/portfolio")
+    assert owner_portfolio.status_code == other_portfolio.status_code == 200
+    assert [position["symbol"] for position in owner_portfolio.json()["positions"]] == ["NVDA"]
+    assert other_portfolio.json()["positions"] == []
+    assert other_portfolio.json()["allocation"] == []
+
+
+def test_portfolio_uses_safe_values_when_provider_data_is_partial(monkeypatch):
+    user = asyncio.run(_create_user())
+
+    async def seed_position():
+        async with Session() as db:
+            portfolio = Portfolio(user_id=user.id, name="Personal portfolio", cash=5_000)
+            db.add(portfolio)
+            await db.flush()
+            db.add(PortfolioPosition(portfolio_id=portfolio.id, symbol="MSFT", quantity=3, average_cost=200, sector="Technology"))
+            await db.commit()
+
+    class PartialProvider:
+        async def get_quote(self, symbol):
+            return {}
+
+    asyncio.run(seed_position())
+    monkeypatch.setattr(main_module, "market_provider", lambda: PartialProvider())
+    with authenticated_client(_principal(user)) as client:
+        response = client.get("/api/portfolio")
+    assert response.status_code == 200
+    position = response.json()["positions"][0]
+    assert position["symbol"] == "MSFT"
+    assert position["price"] == 200
+    assert position["daily_pl"] == 0
 
 
 def test_admin_endpoints_require_role_and_step_up_authentication():

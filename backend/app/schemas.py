@@ -90,6 +90,42 @@ class BacktestRequest(StrictModel):
     transaction_cost_bps: float = Field(default=5, ge=0, le=1000)
 
 
+class PortfolioPositionResponse(StrictModel):
+    symbol: str = Field(min_length=1, max_length=12)
+    quantity: float
+    average_cost: float
+    price: float
+    market_value: float
+    unrealized_pl: float
+    daily_pl: float
+    weight: float = Field(ge=0, le=100)
+    sector: str
+
+
+class PortfolioAllocationResponse(StrictModel):
+    symbol: str = Field(min_length=1, max_length=12)
+    sector: str
+    market_value: float
+    weight: float = Field(ge=0, le=100)
+
+
+class PortfolioResponse(StrictModel):
+    """Stable per-user portfolio payload, including the valid zero-holdings state."""
+
+    mode: Literal["USER"]
+    source: str
+    equity: float
+    total_value: float
+    cash: float
+    buying_power: float
+    exposure: float = Field(ge=0, le=100)
+    day_change: float
+    positions: list[PortfolioPositionResponse] = Field(default_factory=list)
+    allocation: list[PortfolioAllocationResponse] = Field(default_factory=list)
+    orders: list[dict[str, object]] = Field(default_factory=list)
+    equity_curve: list[float] = Field(default_factory=list)
+
+
 class RiskSettings(StrictModel):
     max_position_pct: float | None = Field(default=None, ge=0.1, le=100)
     max_exposure_pct: float | None = Field(default=None, ge=0.1, le=100)
