@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import AliasChoices, Field, model_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     alpaca_base_url: str = "https://paper-api.alpaca.markets"
     alpaca_data_url: str = "https://data.alpaca.markets"
     alpaca_feed: str = "iex"
+    alpaca_options_feed: str = "indicative"
+    market_data_request_timeout_seconds: int = 8
+    market_data_stale_seconds: int = 900
     alpaca_oauth_client_id: str = ""
     alpaca_oauth_client_secret: str = ""
     alpaca_oauth_redirect_uri: str = ""
@@ -105,6 +108,36 @@ class Settings(BaseSettings):
         if self.bootstrap_admin_rate_limit_per_hour < 1 or self.bootstrap_admin_rate_limit_per_hour > 10:
             raise ValueError("BOOTSTRAP_ADMIN_RATE_LIMIT_PER_HOUR must be between 1 and 10.")
         return self
+
+    @field_validator("alpaca_feed")
+    @classmethod
+    def validate_alpaca_feed(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"iex", "sip", "delayed_sip"}:
+            raise ValueError("ALPACA_FEED must be one of iex, sip, or delayed_sip.")
+        return normalized
+
+    @field_validator("alpaca_options_feed")
+    @classmethod
+    def validate_alpaca_options_feed(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"indicative", "opra"}:
+            raise ValueError("ALPACA_OPTIONS_FEED must be indicative or opra.")
+        return normalized
+
+    @field_validator("market_data_request_timeout_seconds")
+    @classmethod
+    def validate_market_data_timeout(cls, value: int) -> int:
+        if not 1 <= value <= 30:
+            raise ValueError("MARKET_DATA_REQUEST_TIMEOUT_SECONDS must be between 1 and 30.")
+        return value
+
+    @field_validator("market_data_stale_seconds")
+    @classmethod
+    def validate_market_data_stale_seconds(cls, value: int) -> int:
+        if not 60 <= value <= 86_400:
+            raise ValueError("MARKET_DATA_STALE_SECONDS must be between 60 and 86400.")
+        return value
 
     @property
     def demo_mode(self) -> bool:

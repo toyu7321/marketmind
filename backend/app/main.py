@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -127,16 +127,49 @@ def _mode(*items: Any) -> str:
             freshness.extend(str(row.get("freshness", "DEMO")) for row in item)
         elif isinstance(item, dict):
             freshness.append(str(item.get("freshness", "DEMO")))
-    live, demo = any(value == "LIVE" for value in freshness), any(value == "DEMO" for value in freshness)
-    return "MIXED" if live and demo else "LIVE" if live else "DEMO"
+    values = {value.upper() for value in freshness}
+    public_values = values - {"UNAVAILABLE"}
+    if not public_values:
+        return "UNAVAILABLE"
+    if "DEMO" in public_values and len(public_values) > 1:
+        return "MIXED"
+    if "DEMO" in public_values:
+        return "DEMO"
+    if "STALE" in values:
+        return "STALE"
+    if "DELAYED" in values:
+        return "DELAYED"
+    if "IEX" in values:
+        return "IEX"
+    return "LIVE"
 
 
-def _stock_score(quote: dict[str, Any], tech: dict[str, Any], market_score: int, weights: dict[str, float]):
+def _technical_from_bars(bars: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Indicators require a usable history; an unavailable feed must not produce synthetic readings."""
+    if len(bars) < 50:
+        return None
+    try:
+        return technical_snapshot([row["close"] for row in bars], [row["high"] for row in bars], [row["low"] for row in bars], [row["volume"] for row in bars])
+    except (KeyError, TypeError, ValueError, IndexError):
+        return None
+
+
+def _unavailable_technical() -> dict[str, Any]:
+    return {"rsi": None, "macd": None, "ema20": None, "ema50": None, "volatility": None, "trend": "unavailable", "support": None, "resistance": None, "volume_spike": None}
+
+
+def _has_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _stock_score(quote: dict[str, Any], tech: dict[str, Any] | None, market_score: int, weights: dict[str, float]):
+    if tech is None or not _has_number(quote.get("change_percent")):
+        return None
     rsi = tech["rsi"]
     values = {
         "Trend": 88 if tech["trend"] == "bullish" else 35 if tech["trend"] == "bearish" else 55,
         "Momentum": max(15, min(92, 50 + (rsi - 50) * 1.4)),
-        "Relative Strength": max(20, min(95, 50 + quote["change_percent"] * 12 + quote["score"] * 0.25)),
+        "Relative Strength": max(20, min(95, 50 + quote["change_percent"] * 12)),
         "Volume": 78 if tech["volume_spike"] else 56,
         "Volatility": max(20, min(90, 96 - tech["volatility"] * 1.2)),
         "Technical Setup": 84 if tech["macd"] > 0 and tech["trend"] == "bullish" else 42,
@@ -170,10 +203,16 @@ async def health(response: Response, db: AsyncSession = Depends(get_db)):
     except Exception:
         database = "unavailable"
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    market_status, news_status, options_status = await asyncio.gather(
+        market_provider().provider_status(), news_provider().provider_status(), options_provider().provider_status(),
+    )
     return {
         "status": "healthy" if database == "available" else "degraded",
         "database": database,
         "authentication": "configured" if settings.auth_ready else "not_configured",
+        **market_status,
+        **news_status,
+        **options_status,
         "live_trading": "locked",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -185,37 +224,51 @@ async def dashboard(principal: Principal = Depends(require_authenticated_user), 
     index_symbols = ["SPY", "QQQ", "DIA", "IWM", "VIX"]
     sector_symbols = ["XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLB", "XLRE", "XLU", "XLC", "SMH", "SOXX"]
     quote_symbols = index_symbols + config["watchlist"][2:] + sector_symbols
-    quotes, market_status, spy_bars = await asyncio.gather(
-        asyncio.gather(*(provider.get_quote(symbol) for symbol in quote_symbols)), provider.get_market_status(), provider.get_bars("SPY", 240)
+    quotes, market_status, spy_bars, watch_bars, provider_status = await asyncio.gather(
+        provider.get_quotes(quote_symbols), provider.get_market_status(), provider.get_bars("SPY", 240),
+        provider.get_bars_bulk(config["watchlist"][2:], 100), provider.provider_status(),
     )
     lookup = {quote["symbol"]: quote for quote in quotes}
-    spy_tech = technical_snapshot([row["close"] for row in spy_bars], [row["high"] for row in spy_bars], [row["low"] for row in spy_bars], [row["volume"] for row in spy_bars])
-    universe = [lookup[symbol] for symbol in config["watchlist"] if symbol in lookup]
+    spy_tech = _technical_from_bars(spy_bars)
+    universe = [lookup[symbol] for symbol in config["watchlist"] if symbol in lookup and _has_number(lookup[symbol].get("change_percent"))]
     advancing = sum(quote["change_percent"] > 0 for quote in universe)
     above_ema = sum(quote["change_percent"] > -0.4 for quote in universe)
     breadth = round(above_ema / len(universe) * 100) if universe else 0
-    market_values = {
-        "Trend": 84 if spy_tech["trend"] == "bullish" else 38 if spy_tech["trend"] == "bearish" else 55,
-        "Momentum": max(15, min(90, 50 + (spy_tech["rsi"] - 50) * 1.4)), "Breadth": breadth,
-        "Volatility": max(20, min(90, 95 - spy_tech["volatility"] * 1.2)),
-        "Relative Strength": max(20, min(90, 50 + lookup["QQQ"]["change_percent"] * 12)), "Macro": 58, "News": 70,
-    }
-    market = score(market_values, config["market_weights"], {
-        "Trend": f"SPY moving-average alignment is {spy_tech['trend']}.", "Momentum": f"SPY RSI is {spy_tech['rsi']}.",
-        "Breadth": f"{breadth}% of the configured watch universe is participating.",
-        "Volatility": f"Annualized rolling volatility is {spy_tech['volatility']}%.",
-        "Macro": "No external macro feed is configured; neutral default applied.", "News": "News contribution is deterministic until a connected feed is available.",
-    })
-    analysis = await analyze_evidence({"score": market.score, "trend": spy_tech["trend"], "breadth": breadth, "volatility": spy_tech["volatility"]})
+    qqq_change = lookup.get("QQQ", {}).get("change_percent")
+    market = None
+    if spy_tech and _has_number(qqq_change):
+        market_values = {
+            "Trend": 84 if spy_tech["trend"] == "bullish" else 38 if spy_tech["trend"] == "bearish" else 55,
+            "Momentum": max(15, min(90, 50 + (spy_tech["rsi"] - 50) * 1.4)), "Breadth": breadth,
+            "Volatility": max(20, min(90, 95 - spy_tech["volatility"] * 1.2)),
+            "Relative Strength": max(20, min(90, 50 + qqq_change * 12)), "Macro": 58, "News": 70,
+        }
+        market = score(market_values, config["market_weights"], {
+            "Trend": f"SPY moving-average alignment is {spy_tech['trend']}.", "Momentum": f"SPY RSI is {spy_tech['rsi']}.",
+            "Breadth": f"{breadth}% of the configured watch universe is participating.",
+            "Volatility": f"Annualized rolling volatility is {spy_tech['volatility']}%.",
+            "Macro": "No external macro feed is configured; neutral default applied.", "News": "News contribution is deterministic until a connected feed is available.",
+        })
+        analysis = await analyze_evidence({"score": market.score, "trend": spy_tech["trend"], "breadth": breadth, "volatility": spy_tech["volatility"]})
+    else:
+        analysis = {"bias": "Unavailable", "confidence": 0, "catalysts": [], "risks": ["Market source did not return enough data for an interpretation."], "invalidation": "Wait for a healthy market-data response.", "source": "RULES"}
+    watchlist = []
+    for symbol in config["watchlist"][2:]:
+        quote = lookup.get(symbol)
+        if quote is None:
+            continue
+        result = _stock_score(quote, _technical_from_bars(watch_bars.get(symbol, [])), market.score if market else 50, config["stock_weights"])
+        watchlist.append({**quote, "score": result.score if result else None, "trend": (_technical_from_bars(watch_bars.get(symbol, [])) or {}).get("trend", quote.get("trend", "Unavailable"))})
     sectors = [{
         "symbol": symbol, "name": {"XLK": "Technology", "XLF": "Financials", "XLE": "Energy", "XLV": "Healthcare", "SMH": "Semiconductors", "SOXX": "Semiconductors"}.get(symbol, symbol),
-        "change": lookup[symbol]["change_percent"], "relative_strength": round(max(0, min(100, 50 + lookup[symbol]["change_percent"] * 15)), 1), "freshness": lookup[symbol]["freshness"],
+        "change": lookup.get(symbol, {}).get("change_percent"), "relative_strength": round(max(0, min(100, 50 + lookup[symbol]["change_percent"] * 15)), 1) if _has_number(lookup.get(symbol, {}).get("change_percent")) else None, "freshness": lookup.get(symbol, {}).get("freshness", "UNAVAILABLE"),
     } for symbol in sector_symbols]
     return {
-        "mode": _mode(quotes, market_status), "status": market_status, "market_score": market,
-        "indices": [lookup[symbol] for symbol in index_symbols], "watchlist": [lookup[symbol] for symbol in config["watchlist"][2:] if symbol in lookup],
+        "mode": _mode(quotes, market_status, spy_bars), "status": market_status, "provider_status": provider_status, "market_score": market,
+        "indices": [lookup[symbol] for symbol in index_symbols if symbol in lookup], "watchlist": watchlist, "spy_bars": spy_bars, "spy_technical": spy_tech or _unavailable_technical(),
         "sectors": sectors, "ai_brief": analysis,
         "breadth": {"label": "Universe Breadth", "above_20d": breadth, "above_50d": max(0, breadth - 7), "advancing": advancing, "declining": len(universe) - advancing, "new_highs": sum(q["change_percent"] > 1 for q in universe), "new_lows": sum(q["change_percent"] < -1 for q in universe)},
+        "vix_note": "VIX is not synthesized. Under an Alpaca IEX feed it is shown only when Alpaca returns a supported symbol; otherwise it is unavailable.",
     }
 
 
@@ -223,36 +276,57 @@ async def dashboard(principal: Principal = Depends(require_authenticated_user), 
 async def scanner(principal: Principal = Depends(require_authenticated_user), db: AsyncSession = Depends(get_db)):
     config, provider = await runtime_settings(db, principal.user.id), market_provider()
     symbols = list(dict.fromkeys(config["watchlist"][2:] + ["JPM", "XOM", "LLY", "AVGO", "NFLX", "COST"]))
-    quotes = await asyncio.gather(*(provider.get_quote(symbol) for symbol in symbols))
+    quotes, bars_by_symbol, provider_status = await asyncio.gather(provider.get_quotes(symbols), provider.get_bars_bulk(symbols, 120), provider.provider_status())
     output = []
     for quote in quotes:
-        bars = await provider.get_bars(quote["symbol"], 90)
-        tech = technical_snapshot([row["close"] for row in bars], [row["high"] for row in bars], [row["low"] for row in bars], [row["volume"] for row in bars])
-        result = _stock_score(quote, tech, 70, config["stock_weights"])
-        output.append({**quote, **tech, "score": result.score, "five_day": round((bars[-1]["close"] / bars[-6]["close"] - 1) * 100, 2), "momentum": "High" if result.score >= 70 else "Medium" if result.score >= 50 else "Low", "relative_strength": round(max(0, min(100, result.score * 0.92)), 1), "news_sentiment": "Positive" if quote["change_percent"] > 0 else "Neutral", "ai_confidence": min(88, result.confidence), "freshness": _mode(quote, bars)})
-    return {"mode": _mode(output), "results": sorted(output, key=lambda row: row["score"], reverse=True)}
+        bars = bars_by_symbol.get(quote["symbol"], [])
+        tech = _technical_from_bars(bars)
+        result = _stock_score(quote, tech, 50, config["stock_weights"])
+        five_day = round((bars[-1]["close"] / bars[-6]["close"] - 1) * 100, 2) if len(bars) >= 6 else None
+        output.append({
+            **quote, **(tech or _unavailable_technical()), "score": result.score if result else None, "five_day": five_day,
+            "momentum": "High" if result and result.score >= 70 else "Medium" if result and result.score >= 50 else "Unavailable" if not result else "Low",
+            "relative_strength": round(max(0, min(100, result.score * 0.92)), 1) if result else None,
+            "news_sentiment": "Unavailable", "ai_confidence": result.confidence if result else None, "freshness": _mode(quote, bars),
+        })
+    return {"mode": _mode(output), "provider_status": provider_status, "results": sorted(output, key=lambda row: (row["score"] is None, -(row["score"] or 0)))}
 
 
 @app.get("/api/stocks/{symbol}")
-async def stock(symbol: str, principal: Principal = Depends(require_authenticated_user), db: AsyncSession = Depends(get_db)):
+async def stock(symbol: str, range_name: str = Query(default="3M", alias="range", pattern="^(1D|5D|1M|3M|6M|1Y)$"), principal: Principal = Depends(require_authenticated_user), db: AsyncSession = Depends(get_db)):
     symbol = symbol.upper()
     if not symbol.isalnum() or len(symbol) > 8:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid symbol")
     config, provider = await runtime_settings(db, principal.user.id), market_provider()
-    quote, bars = await asyncio.gather(provider.get_quote(symbol), provider.get_bars(symbol, 240))
-    tech = technical_snapshot([row["close"] for row in bars], [row["high"] for row in bars], [row["low"] for row in bars], [row["volume"] for row in bars])
-    result = _stock_score(quote, tech, 70, config["stock_weights"])
-    analysis = await analyze_evidence({"ticker": symbol, "stock_score": result.score, "rsi": tech["rsi"], "macd": tech["macd"], "trend": tech["trend"], "relative_strength": "strong" if result.score >= 70 else "mixed", "risk_events": []})
+    quote, technical_bars, chart_bars, news_result, provider_status = await asyncio.gather(
+        provider.get_quote(symbol), provider.get_bars(symbol, 260), provider.get_bars_for_range(symbol, range_name), news_provider().get_news([symbol]), provider.provider_status(),
+    )
+    news_mode, all_news = news_result
+    tech = _technical_from_bars(technical_bars)
+    result = _stock_score(quote, tech, 50, config["stock_weights"])
+    if result and tech:
+        analysis = await analyze_evidence({"ticker": symbol, "stock_score": result.score, "rsi": tech["rsi"], "macd": tech["macd"], "trend": tech["trend"], "relative_strength": "strong" if result.score >= 70 else "mixed", "risk_events": []})
+    else:
+        analysis = {"bias": "Unavailable", "confidence": 0, "base_case": "Await a usable quote and at least 50 daily bars before interpreting this symbol.", "bull_case": "Unavailable until provider data is healthy.", "bear_case": "Unavailable until provider data is healthy.", "invalidation": "Market data is unavailable.", "catalysts": [], "risks": ["No usable provider history"], "source": "RULES"}
     filings = await EdgarSECProvider().filings_for_symbol(symbol)
-    news = [{"time": "14:32", "headline": f"{quote['company']} remains in focus as investors assess sector momentum", "tickers": [symbol], "sector": "Technology", "sentiment": "Positive", "importance": "High", "why": "Demo context is shown until a connected ticker-news feed returns related articles.", "freshness": "DEMO"}]
-    return {"mode": _mode(quote, bars, filings), "quote": quote, "bars": bars, "technical": tech, "score": result, "analysis": analysis, "outlooks": [{"horizon": days, "bull": min(70, result.score - 8 + days), "neutral": 25, "bear": max(5, 83 - result.score - days), "confidence": min(82, result.confidence - days)} for days in (1, 3, 5)], "news": news, "filings": filings or _demo_filings(), "fundamentals": {"revenue": "$130.5B", "revenue_growth": "+34.2%", "eps": "$4.18", "gross_margin": "71.3%", "forward_pe": "31.8x", "trend": "Improving", "freshness": "DEMO"}}
+    ticker_news = [article for article in all_news if symbol in str(article.get("affected", "")).split(", ")]
+    if not ticker_news and news_mode == "DEMO":
+        ticker_news = all_news
+    outlooks = [{"horizon": days, "bull": min(70, result.score - 8 + days), "neutral": 25, "bear": max(5, 83 - result.score - days), "confidence": min(82, result.confidence - days)} for days in (1, 3, 5)] if result else []
+    return {
+        "mode": _mode(quote, technical_bars, chart_bars), "provider_status": provider_status, "quote": quote, "bars": chart_bars, "technical": tech or _unavailable_technical(), "score": result,
+        "analysis": analysis, "outlooks": outlooks, "news": ticker_news, "news_mode": news_mode, "filings": filings or _demo_filings(),
+        "fundamentals": {"revenue": "$130.5B", "revenue_growth": "+34.2%", "eps": "$4.18", "gross_margin": "71.3%", "forward_pe": "31.8x", "trend": "Improving", "freshness": "DEMO", "source": "Demo reference data"},
+        "chart_range": range_name, "company_metadata_source": quote.get("company_metadata_source"),
+    }
 
 
 @app.get("/api/news")
 async def news(principal: Principal = Depends(require_authenticated_user), db: AsyncSession = Depends(get_db)):
     config = await runtime_settings(db, principal.user.id)
-    mode, items = await news_provider().get_news(config["watchlist"])
-    return {"mode": mode, "items": items}
+    provider = news_provider()
+    mode, items = await provider.get_news(config["watchlist"])
+    return {"mode": mode, "provider_status": await provider.provider_status(), "items": items, "message": "Alpaca News did not return a feed for this account or request." if mode == "UNAVAILABLE" else None}
 
 
 @app.get("/api/options/{symbol}")
@@ -260,12 +334,14 @@ async def options(symbol: str, _: Principal = Depends(require_authenticated_user
     symbol = symbol.upper()
     if not symbol.isalnum() or len(symbol) > 8:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid symbol")
-    quote = await market_provider().get_quote(symbol)
-    source, chain = await options_provider().get_chain(symbol, quote["price"])
+    market, options_data = market_provider(), options_provider()
+    quote = await market.get_quote(symbol)
+    source, chain = await options_data.get_chain(symbol, quote.get("price"))
+    options_status = await options_data.provider_status()
     valid_iv = [row["iv"] for row in chain if row.get("iv") is not None]
     call_volume = sum(row.get("volume") or 0 for row in chain if row["type"] == "CALL")
     put_volume = sum(row.get("volume") or 0 for row in chain if row["type"] == "PUT")
-    return {"mode": source, "symbol": symbol, "spot": quote["price"], "put_call_ratio": round(put_volume / call_volume, 2) if call_volume else None, "iv_rank": round(sum(valid_iv) / len(valid_iv), 1) if valid_iv else None, "chain": chain, "strategies": strategy_candidates(quote["price"], chain)}
+    return {"mode": source, "symbol": symbol, "spot": quote.get("price"), "quote_quality": quote.get("freshness"), "provider_status": options_status, "put_call_ratio": round(put_volume / call_volume, 2) if call_volume else None, "iv_rank": round(sum(valid_iv) / len(valid_iv), 1) if valid_iv else None, "chain": chain, "strategies": strategy_candidates(quote["price"], chain) if _has_number(quote.get("price")) else [], "message": "Live options data is unavailable for the configured Alpaca account/feed. No synthetic contracts are shown." if source == "UNAVAILABLE" else None}
 
 
 @app.post("/api/risk/evaluate", dependencies=[Depends(rate_limit("risk", 30))])
@@ -442,7 +518,17 @@ async def submit_paper_order(order: PaperOrderRequest, request: Request, idempot
 async def get_settings_endpoint(principal: Principal = Depends(require_authenticated_user), db: AsyncSession = Depends(get_db)):
     config = await runtime_settings(db, principal.user.id)
     security = await db.get(SystemSetting, "security")
-    return {**config, "providers": {"Market Data": "Demo" if settings.demo_mode else "Alpaca configured", "News": "Demo" if settings.demo_mode else "Alpaca configured", "OpenAI": "Connected" if settings.openai_enabled else "Offline (rules fallback)", "SEC": "Configured" if settings.sec_is_configured else "Available", "Broker": "Not connected", "Paper order submission": "Disabled until OAuth connection activation", "Live Trading": "Locked"}, "security": {"global_kill_switch": bool(security and security.value.get("global_kill_switch")), "user_kill_switch": principal.user.kill_switch_enabled, "mfa_level": principal.aal}}
+    market_status, news_status, options_status = await asyncio.gather(
+        market_provider().provider_status(), news_provider().provider_status(), options_provider().provider_status(),
+    )
+    providers = {
+        "Market Data": f"{market_status['market_provider']} · {market_status['market_feed']} · {market_status['market_data_status']}",
+        "News": f"{news_status['news_provider']} · {news_status['news_status']}",
+        "Options": f"{options_status['options_provider']} · {options_status['options_status']}",
+        "OpenAI": "Connected" if settings.openai_enabled else "Offline (rules fallback)", "SEC": "Configured" if settings.sec_is_configured else "Available",
+        "Broker": "Not connected", "Paper order submission": "Disabled until OAuth connection activation", "Live Trading": "Locked",
+    }
+    return {**config, "providers": providers, "provider_status": {**market_status, **news_status, **options_status}, "security": {"global_kill_switch": bool(security and security.value.get("global_kill_switch")), "user_kill_switch": principal.user.kill_switch_enabled, "mfa_level": principal.aal}}
 
 
 @app.put("/api/settings", dependencies=[Depends(rate_limit("settings", 20))])

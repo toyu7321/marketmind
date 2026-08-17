@@ -72,6 +72,11 @@ OPENAI_API_KEY=
 ENABLE_OPENAI_ANALYSIS=false
 ALPACA_API_KEY=
 ALPACA_SECRET_KEY=
+ALPACA_DATA_URL=https://data.alpaca.markets
+ALPACA_FEED=iex
+ALPACA_OPTIONS_FEED=indicative
+MARKET_DATA_REQUEST_TIMEOUT_SECONDS=8
+MARKET_DATA_STALE_SECONDS=900
 ALPACA_OAUTH_CLIENT_ID=
 ALPACA_OAUTH_CLIENT_SECRET=
 ALPACA_OAUTH_REDIRECT_URI=
@@ -80,7 +85,9 @@ SEC_USER_AGENT=MarketMind security@example.com
 
 Use the host’s encrypted environment-variable facility. Never put the secret key, audit HMAC secret, database URL, broker credentials, OAuth client secret, or token-store credentials in Vercel, Git, browser storage, `NEXT_PUBLIC_*`, or logs. The container runs Alembic during startup; a managed release command that runs `alembic upgrade head` before deployment is preferred for controlled production changes.
 
-At this stage, visit `https://YOUR_API/api/health`. It should return `healthy`, `authentication: configured`, and `live_trading: locked`, without secret values.
+At this stage, visit `https://YOUR_API/api/health`. It should return `healthy`, `authentication: configured`, and `live_trading: locked`, without secret values. The market-specific fields are intentionally safe: `market_provider`, `market_feed`, `market_data_status`, `news_provider`, and `options_provider`. The first successful public request changes a configured Alpaca connection to `Healthy`; a feed failure becomes `Degraded` and never produces synthetic live-looking values.
+
+For Live Market Data V1, keep `ALPACA_DATA_URL=https://data.alpaca.markets` and start with `ALPACA_FEED=iex`. IEX is visibly labelled as such. Only select `sip` after confirming the account is entitled to that feed; `delayed_sip` is visibly delayed. Options defaults to `indicative` and will show an unavailable capability panel if the account/feed does not return a chain. Do not set any of these values in Vercel or under a `NEXT_PUBLIC_` name.
 
 ## 4. Bootstrap the first administrator without a shell
 

@@ -104,6 +104,30 @@ Copy `.env.example` and keep secrets only in the backend host configuration.
 | `BACKEND_URL` | frontend host only | Server-side same-origin API proxy target, for example `https://marketmind-api.example-host.app` |
 | `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | frontend host | Public Supabase browser configuration; never place secrets under `NEXT_PUBLIC_` |
 
+## Live Market Data V1 (Alpaca REST)
+
+MarketMind uses Alpaca only from the FastAPI backend. Add the following values to the **Render backend** environment; do not add them to Vercel, `NEXT_PUBLIC_*`, Supabase, browser storage, or GitHub:
+
+```text
+ALPACA_API_KEY=...
+ALPACA_SECRET_KEY=...
+ALPACA_DATA_URL=https://data.alpaca.markets
+ALPACA_FEED=iex
+ALPACA_OPTIONS_FEED=indicative
+MARKET_DATA_REQUEST_TIMEOUT_SECONDS=8
+MARKET_DATA_STALE_SECONDS=900
+ENABLE_LIVE_TRADING=false
+ENABLE_REMOTE_PAPER_ORDERS=false
+```
+
+`IEX` is a live but exchange-limited stock feed. If the account has the relevant entitlement, set `ALPACA_FEED=sip`; use `delayed_sip` only when intentionally accepting delayed data. MarketMind displays **LIVE**, **IEX**, **DELAYED**, **STALE**, **DEMO**, or **UNAVAILABLE** next to public market data. It does not merge a failed Alpaca response with synthetic values: no credentials select the explicit demo provider, while a configured provider failure renders an unavailable state.
+
+The REST adapter uses Alpaca stock snapshots (`/v2/stocks/snapshots`), historical stock bars (`/v2/stocks/{symbol}/bars` and batched `/v2/stocks/bars`), news (`/v1beta1/news`), and options snapshots (`/v1beta1/options/snapshots/{underlying}`). Quotes are short-cached, scanner snapshots/bars are batched and cached, daily history has a longer cache, and news/options have short public caches. No account, portfolio, authentication, or broker data is stored in those shared caches.
+
+The Dashboard, Markets, Scanner, Stock Intel, News, Options, Settings, and `/api/health` now expose the provider/feed/status boundary. Stock Intel requests actual OHLCV ranges for `1D`, `5D`, `1M`, `3M`, `6M`, and `1Y`; technical indicators are calculated locally from provider bars. VIX is never synthesized: under an Alpaca IEX setup it appears only if Alpaca returns a supported symbol, otherwise its card is explicitly unavailable. Alpaca options are shown only when the configured account/feed returns them; a missing entitlement shows an availability message instead of demo contracts.
+
+This release is REST/snapshot polling by design. The `MarketDataProvider` boundary isolates quote, batch, bar, news, and option retrieval so a future Alpaca WebSocket subscriber can update the same normalized public-data cache without altering clients. No WebSocket connection is required for Live Market Data V1.
+
 ## Security status
 
 MarketMind now fails closed: private routes require a provider-verified identity and an active MarketMind user record. The Admin Console is invite-only and requires TOTP MFA; every owned resource is scoped to the authenticated user and direct-object access attempts return a generic not-found response. The security page includes MFA setup, session visibility, and session revocation. Administrative actions, user/risk changes, broker connection setup, and blocked trade attempts are audited without logging secrets or raw addresses.
@@ -119,9 +143,10 @@ cd backend
 pytest -q
 
 cd ../frontend
-npm run typecheck
-npm run lint
-npm run build
+pnpm install --frozen-lockfile
+pnpm run typecheck
+pnpm run lint
+pnpm run build
 ```
 
 The production health endpoint checks API and database availability:
