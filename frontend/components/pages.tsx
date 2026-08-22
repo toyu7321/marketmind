@@ -1,7 +1,7 @@
 'use client';
-import {useEffect,useState} from 'react'; import Link from 'next/link'; import {api,money} from '@/lib/api'; import {marketProviderLabel,marketQualityTone} from '@/lib/market-data'; import {normalizePortfolio} from '@/lib/portfolio'; import {PortfolioEmptyState} from './portfolio-empty-state'; import {Badge,BigChart,ErrorState,Panel,ScoreRing,Skeleton,Spark} from './ui'; import {ArrowDownRight,ArrowUpRight,BrainCircuit,Check,CloudOff,ExternalLink,Filter,Plus,RefreshCw,Search,ShieldAlert,Target,Zap} from 'lucide-react';
+import {useEffect,useState} from 'react'; import Link from 'next/link'; import {api,money} from '@/lib/api'; import {useApiData} from '@/lib/data'; import {marketProviderLabel,marketQualityTone} from '@/lib/market-data'; import {normalizePortfolio} from '@/lib/portfolio'; import {PortfolioEmptyState} from './portfolio-empty-state'; import {Badge,BigChart,ErrorState,Panel,ScoreRing,Skeleton,Spark} from './ui'; import {ArrowDownRight,ArrowUpRight,BrainCircuit,Check,CloudOff,ExternalLink,Filter,Plus,RefreshCw,Search,ShieldAlert,Target,Zap} from 'lucide-react';
 type Any=Record<string,any>;
-function useData(path:string){const [data,setData]=useState<Any>(),[error,setError]=useState(false),[tick,setTick]=useState(0);useEffect(()=>{setError(false);api<Any>(path).then(setData).catch(()=>setError(true))},[path,tick]);return {data,error,retry:()=>setTick(x=>x+1)}}
+function useData(path:string){return useApiData<Any>(path)}
 const isNumber=(value:unknown):value is number=>typeof value==='number'&&Number.isFinite(value);
 const percent=(value:unknown)=>isNumber(value)?`${value>0?'+':''}${value}%`:'—';
 const qualityTone=marketQualityTone;

@@ -3,6 +3,7 @@
 import {FormEvent, useState} from 'react';
 import {useRouter, useSearchParams} from 'next/navigation';
 import {ArrowRight, LockKeyhole, ShieldCheck} from 'lucide-react';
+import {clearClientDataCache} from '@/lib/data';
 import {authConfigured, createSupabaseBrowserClient} from '@/lib/supabase/client';
 
 export function AuthLogin() {
@@ -20,7 +21,7 @@ export function AuthLogin() {
     setBusy(true); setMessage('');
     const {error} = await createSupabaseBrowserClient().auth.signInWithPassword({email, password});
     if (error) setMessage('Unable to sign in. Check your credentials or invitation status.');
-    else router.replace(search.get('next')?.startsWith('/') ? search.get('next')! : '/');
+    else { void clearClientDataCache(); router.replace(search.get('next')?.startsWith('/') ? search.get('next')! : '/'); }
     setBusy(false);
   }
 

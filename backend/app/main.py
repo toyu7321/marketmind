@@ -298,8 +298,9 @@ async def stock(symbol: str, range_name: str = Query(default="3M", alias="range"
     if not symbol.isalnum() or len(symbol) > 8:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid symbol")
     config, provider = await runtime_settings(db, principal.user.id), market_provider()
-    quote, technical_bars, chart_bars, news_result, provider_status = await asyncio.gather(
+    quote, technical_bars, chart_bars, news_result, provider_status, filings = await asyncio.gather(
         provider.get_quote(symbol), provider.get_bars(symbol, 260), provider.get_bars_for_range(symbol, range_name), news_provider().get_news([symbol]), provider.provider_status(),
+        EdgarSECProvider().filings_for_symbol(symbol),
     )
     news_mode, all_news = news_result
     tech = _technical_from_bars(technical_bars)
@@ -308,7 +309,6 @@ async def stock(symbol: str, range_name: str = Query(default="3M", alias="range"
         analysis = await analyze_evidence({"ticker": symbol, "stock_score": result.score, "rsi": tech["rsi"], "macd": tech["macd"], "trend": tech["trend"], "relative_strength": "strong" if result.score >= 70 else "mixed", "risk_events": []})
     else:
         analysis = {"bias": "Unavailable", "confidence": 0, "base_case": "Await a usable quote and at least 50 daily bars before interpreting this symbol.", "bull_case": "Unavailable until provider data is healthy.", "bear_case": "Unavailable until provider data is healthy.", "invalidation": "Market data is unavailable.", "catalysts": [], "risks": ["No usable provider history"], "source": "RULES"}
-    filings = await EdgarSECProvider().filings_for_symbol(symbol)
     ticker_news = [article for article in all_news if symbol in str(article.get("affected", "")).split(", ")]
     if not ticker_news and news_mode == "DEMO":
         ticker_news = all_news
@@ -335,9 +335,18 @@ async def options(symbol: str, _: Principal = Depends(require_authenticated_user
     if not symbol.isalnum() or len(symbol) > 8:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid symbol")
     market, options_data = market_provider(), options_provider()
-    quote = await market.get_quote(symbol)
-    source, chain = await options_data.get_chain(symbol, quote.get("price"))
-    options_status = await options_data.provider_status()
+    if get_settings().demo_mode:
+        # Demo option premiums are derived from the demo underlying, so retain
+        # that dependency rather than producing mismatched synthetic contracts.
+        quote, options_status = await asyncio.gather(market.get_quote(symbol), options_data.provider_status())
+        source, chain = await options_data.get_chain(symbol, quote.get("price"))
+    else:
+        # Live option snapshots do not require the equity quote. Fetch both in
+        # parallel to avoid a quote round trip delaying the options terminal.
+        quote, option_result, options_status = await asyncio.gather(
+            market.get_quote(symbol), options_data.get_chain(symbol, None), options_data.provider_status(),
+        )
+        source, chain = option_result
     valid_iv = [row["iv"] for row in chain if row.get("iv") is not None]
     call_volume = sum(row.get("volume") or 0 for row in chain if row["type"] == "CALL")
     put_volume = sum(row.get("volume") or 0 for row in chain if row["type"] == "PUT")

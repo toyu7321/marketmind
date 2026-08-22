@@ -1,5 +1,5 @@
 /* MarketMind worker: cache only public static assets, never authenticated screens or API data. */
-const VERSION = 'marketmind-shell-v4';
+const VERSION = 'marketmind-shell-v5';
 const SHELL = [
   '/offline', '/manifest.webmanifest',
   '/icons/marketmind.svg', '/icons/marketmind-maskable.svg',

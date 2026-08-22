@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import asyncio
 
 import httpx
 import pytest
 
 from app.config import get_settings
+from app import main as main_module
 from app.indicators import technical_snapshot
 from app.providers import AlpacaMarketProvider
 
@@ -111,3 +113,39 @@ async def test_provider_status_never_leaks_credentials(monkeypatch):
         assert set(payload) == {"market_provider", "market_feed", "market_data_status", "connection", "last_successful_request"}
     finally:
         get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_live_options_quote_chain_and_status_start_in_parallel(monkeypatch):
+    started: list[str] = []
+    gate = asyncio.Event()
+
+    async def synchronize(name: str):
+        started.append(name)
+        if len(started) == 3:
+            gate.set()
+        await asyncio.wait_for(gate.wait(), timeout=0.15)
+
+    class Market:
+        async def get_quote(self, _symbol: str):
+            await synchronize("quote")
+            return {"price": 100.0, "freshness": "IEX"}
+
+    class Options:
+        async def get_chain(self, _symbol: str, spot: float | None):
+            assert spot is None
+            await synchronize("chain")
+            return "LIVE", []
+
+        async def provider_status(self):
+            await synchronize("status")
+            return {"options_status": "Healthy"}
+
+    monkeypatch.setattr(main_module, "market_provider", lambda: Market())
+    monkeypatch.setattr(main_module, "options_provider", lambda: Options())
+    monkeypatch.setattr(main_module, "get_settings", lambda: type("Settings", (), {"demo_mode": False})())
+
+    payload = await main_module.options("NVDA", None)
+
+    assert set(started) == {"quote", "chain", "status"}
+    assert payload["mode"] == "LIVE"

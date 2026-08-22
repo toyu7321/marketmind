@@ -1,7 +1,7 @@
 'use client';
 
 import {useEffect, useState} from 'react';
-import {api} from '@/lib/api';
+import {useApiData} from '@/lib/data';
 
 type WaitingWorker = ServiceWorker | null;
 
@@ -14,6 +14,7 @@ export function PwaClient() {
   const [starting, setStarting] = useState(false);
   const [updateWorker, setUpdateWorker] = useState<WaitingWorker>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const {data: health, error: healthError} = useApiData<Record<string, string>>('/health');
 
   useEffect(() => {
     const updateConnection = () => setOnline(navigator.onLine);
@@ -21,24 +22,22 @@ export function PwaClient() {
     addEventListener('online', updateConnection);
     addEventListener('offline', updateConnection);
 
-    if (isStandalone()) {
-      setStarting(true);
-      const controller = new AbortController();
-      api<Record<string, string>>('/health', {signal: controller.signal}).catch(() => undefined).finally(() => setStarting(false));
-      const timeout = window.setTimeout(() => controller.abort(), 4500);
-      return () => {
-        removeEventListener('online', updateConnection);
-        removeEventListener('offline', updateConnection);
-        window.clearTimeout(timeout);
-        controller.abort();
-      };
-    }
-
     return () => {
       removeEventListener('online', updateConnection);
       removeEventListener('offline', updateConnection);
     };
   }, []);
+
+  useEffect(() => {
+    if (!isStandalone()) return;
+    setStarting(true);
+    if (health || healthError) {
+      setStarting(false);
+      return;
+    }
+    const timeout = window.setTimeout(() => setStarting(false), 4_500);
+    return () => window.clearTimeout(timeout);
+  }, [health, healthError]);
 
   useEffect(() => {
     if (!('serviceWorker' in navigator)) return;

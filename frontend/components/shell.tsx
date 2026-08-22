@@ -9,6 +9,7 @@ import {
   SlidersHorizontal, Sparkles, UserRoundCog, X, Zap,
 } from 'lucide-react';
 import {api} from '@/lib/api';
+import {clearClientDataCache, useApiData} from '@/lib/data';
 import {authConfigured, createSupabaseBrowserClient} from '@/lib/supabase/client';
 
 const nav = [
@@ -23,15 +24,16 @@ type Account = {user:{display_name:string;email:string;role:string}};
 export function Shell({children}: {children: React.ReactNode}) {
   const path = usePathname(); const router = useRouter();
   const [mobile, setMobile] = useState(false); const [palette, setPalette] = useState(false); const [kiosk, setKiosk] = useState(false);
-  const [health, setHealth] = useState<Record<string, string>>(); const [account, setAccount] = useState<Account>();
+  const {data: health} = useApiData<Record<string, string>>('/health');
+  const {data: account} = useApiData<Account>('/account');
   useEffect(() => {
     const keyboard = (event: KeyboardEvent) => { if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); setPalette(value => !value); } if (event.key === 'Escape') setPalette(false); };
-    addEventListener('keydown', keyboard); api<Record<string, string>>('/health').then(setHealth).catch(() => undefined); api<Account>('/account').then(setAccount).catch(() => undefined);
+    addEventListener('keydown', keyboard);
     return () => removeEventListener('keydown', keyboard);
   }, []);
   const visibleNav = useMemo(() => account?.user.role === 'ADMIN' ? [...nav, ['/admin', 'Admin', UserRoundCog] as const] : nav, [account?.user.role]);
   const navigate = (target: string) => { router.push(target); setPalette(false); };
-  const signOut = async () => { try { await api('/account/logout', {method:'POST'}); } catch {} if (authConfigured()) await createSupabaseBrowserClient().auth.signOut(); router.replace('/login'); };
+  const signOut = async () => { try { await api('/account/logout', {method:'POST'}); } catch {} void clearClientDataCache(); if (authConfigured()) await createSupabaseBrowserClient().auth.signOut(); router.replace('/login'); };
   const appClass = 'app-shell' + (kiosk ? ' kiosk' : '');
   return <div className={appClass}><aside className={mobile ? 'open' : ''}>
     <div className="brand"><span className="brand-mark"><Sparkles size={17}/></span><div><b>MARKET<span>MIND</span></b><small>INTELLIGENCE TERMINAL</small></div><button className="mobile-close" onClick={() => setMobile(false)}><X/></button></div>

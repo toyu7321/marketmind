@@ -1,1 +1,4 @@
-import {Shell} from '@/components/shell';import {News} from '@/components/pages';export default function Page(){return <Shell><News/></Shell>}
+import {NewsFeed} from '@/components/news-feed';
+import {Shell} from '@/components/shell';
+
+export default function Page() { return <Shell><NewsFeed/></Shell>; }
