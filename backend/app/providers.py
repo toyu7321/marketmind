@@ -15,6 +15,7 @@ from typing import Any
 import httpx
 
 from .config import get_settings
+from .observability import cache_event, measure
 from .schemas import AIAnalysis
 
 logger = logging.getLogger(__name__)
@@ -87,22 +88,123 @@ class _PublicTTLCache:
     """Small in-process cache for public market data only; private account data never enters it."""
 
     def __init__(self) -> None:
-        self._entries: dict[str, tuple[float, Any]] = {}
+        self._entries: dict[str, tuple[float, float, Any]] = {}
+        self._inflight: dict[str, asyncio.Task[Any]] = {}
+        self._stats: dict[str, int] = {}
         self._lock = asyncio.Lock()
 
-    async def get_or_load(self, key: str, ttl_seconds: int, loader: Any) -> Any:
+    def _group(self, key: str) -> str:
+        if key.startswith("scanner-bars"):
+            return "scanner_bars"
+        return key.split(":", 1)[0]
+
+    def _record(self, key: str, outcome: str) -> None:
+        stat_key = f"{self._group(key)}:{outcome}"
+        self._stats[stat_key] = self._stats.get(stat_key, 0) + 1
+        cache_event(self._group(key), outcome)
+
+    async def _load_and_store(self, key: str, ttl_seconds: int, stale_seconds: int, loader: Any) -> Any:
+        try:
+            value = await loader()
+            expires_at = time.monotonic() + ttl_seconds
+            async with self._lock:
+                self._entries[key] = (expires_at, expires_at + stale_seconds, value)
+            return value
+        finally:
+            async with self._lock:
+                if self._inflight.get(key) is asyncio.current_task():
+                    self._inflight.pop(key, None)
+
+    async def get_or_load(self, key: str, ttl_seconds: int, loader: Any, *, stale_seconds: int = 0) -> Any:
+        """Deduplicate misses and optionally refresh historical public data in background.
+
+        Quotes remain strict-TTL.  Only explicitly opted-in historical resources
+        can return a stale value while a single refresh is underway.
+        """
         now = time.monotonic()
         async with self._lock:
             cached = self._entries.get(key)
             if cached and cached[0] > now:
-                return cached[1]
-        value = await loader()
+                self._record(key, "hit")
+                return cached[2]
+            if cached and stale_seconds and cached[1] > now:
+                self._record(key, "stale_refresh")
+                if key not in self._inflight:
+                    task = asyncio.create_task(self._load_and_store(key, ttl_seconds, stale_seconds, loader))
+                    self._inflight[key] = task
+                    # The response is intentionally ignored: a stale historical
+                    # value is already returned and the next request sees fresh data.
+                    task.add_done_callback(lambda completed: completed.exception() if not completed.cancelled() else None)
+                return cached[2]
+            task = self._inflight.get(key)
+            if task is None:
+                self._record(key, "miss")
+                task = asyncio.create_task(self._load_and_store(key, ttl_seconds, stale_seconds, loader))
+                self._inflight[key] = task
+            else:
+                self._record(key, "coalesced")
+        return await task
+
+    async def get(self, key: str) -> Any | None:
         async with self._lock:
-            self._entries[key] = (time.monotonic() + ttl_seconds, value)
-        return value
+            cached = self._entries.get(key)
+            if cached and cached[0] > time.monotonic():
+                self._record(key, "hit")
+                return cached[2]
+            return None
+
+    async def put(self, key: str, ttl_seconds: int, value: Any) -> None:
+        expires_at = time.monotonic() + ttl_seconds
+        async with self._lock:
+            self._entries[key] = (expires_at, expires_at, value)
+
+    def report(self) -> dict[str, Any]:
+        return {"entries": len(self._entries), "inflight": len(self._inflight), "outcomes": dict(sorted(self._stats.items()))}
+
+    async def clear(self) -> None:
+        async with self._lock:
+            self._entries.clear()
+            self._inflight.clear()
+            self._stats.clear()
 
 
 _public_market_cache = _PublicTTLCache()
+_alpaca_client: httpx.AsyncClient | None = None
+_alpaca_client_lock = asyncio.Lock()
+
+
+def _alpaca_timeout() -> httpx.Timeout:
+    timeout = get_settings().market_data_request_timeout_seconds
+    return httpx.Timeout(timeout, connect=min(float(timeout), 4.0))
+
+
+async def start_provider_clients() -> None:
+    """Start one keep-alive client per backend process for Alpaca REST requests."""
+    global _alpaca_client
+    async with _alpaca_client_lock:
+        if _alpaca_client is None or _alpaca_client.is_closed:
+            _alpaca_client = httpx.AsyncClient(
+                timeout=_alpaca_timeout(),
+                limits=httpx.Limits(max_connections=20, max_keepalive_connections=12, keepalive_expiry=45),
+            )
+
+
+async def close_provider_clients() -> None:
+    global _alpaca_client
+    async with _alpaca_client_lock:
+        client, _alpaca_client = _alpaca_client, None
+    if client is not None and not client.is_closed:
+        await client.aclose()
+
+
+async def alpaca_http_client() -> httpx.AsyncClient:
+    await start_provider_clients()
+    assert _alpaca_client is not None
+    return _alpaca_client
+
+
+def public_market_cache_report() -> dict[str, Any]:
+    return _public_market_cache.report()
 _provider_activity: dict[str, dict[str, str | None]] = {
     "market": {"last_successful_request": None, "last_failure": None},
     "news": {"last_successful_request": None, "last_failure": None},
@@ -218,19 +320,22 @@ class DemoMarketProvider(MarketDataProvider):
 class AlpacaMarketProvider(MarketDataProvider):
     """REST-first Alpaca adapter. Configured provider failures are explicit, never synthetic."""
 
-    async def _json(self, path: str, params: dict[str, Any], cache_key: str, ttl_seconds: int) -> dict[str, Any]:
+    async def _json(self, path: str, params: dict[str, Any], cache_key: str, ttl_seconds: int, *, stale_seconds: int = 0) -> dict[str, Any]:
         settings = get_settings()
+        metric = "alpaca.quotes" if cache_key.startswith("quotes:") else "alpaca.bars" if "bars" in cache_key else "alpaca.market"
 
         async def load() -> dict[str, Any]:
-            async with httpx.AsyncClient(timeout=settings.market_data_request_timeout_seconds) as client:
+            client = await alpaca_http_client()
+            with measure(metric):
                 response = await client.get(f"{settings.alpaca_data_url.rstrip('/')}{path}", headers=_headers(), params=params)
-                response.raise_for_status()
-                payload = response.json()
-                if not isinstance(payload, dict):
-                    raise ValueError("Alpaca response was not an object")
-                return payload
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError("Alpaca response was not an object")
+            return payload
 
-        return await _public_market_cache.get_or_load(cache_key, ttl_seconds, load)
+        historical_stale_seconds = stale_seconds or (1_800 if "bars" in cache_key else 0)
+        return await _public_market_cache.get_or_load(cache_key, ttl_seconds, load, stale_seconds=historical_stale_seconds)
 
     def _quote_from_snapshot(self, symbol: str, payload: dict[str, Any]) -> dict[str, Any]:
         settings = get_settings()
@@ -278,27 +383,36 @@ class AlpacaMarketProvider(MarketDataProvider):
         cleaned = list(dict.fromkeys(symbol.strip().upper() for symbol in symbols if symbol.strip()))
         if not cleaned:
             return []
+        cached_quotes = {
+            symbol: await _public_market_cache.get(f"quote:{settings.alpaca_feed}:{symbol}")
+            for symbol in cleaned
+        }
+        missing = [symbol for symbol in cleaned if cached_quotes[symbol] is None]
+        if not missing:
+            return [cached_quotes[symbol] for symbol in cleaned]
         try:
-            payload = await self._json("/v2/stocks/snapshots", {"symbols": ",".join(cleaned), "feed": settings.alpaca_feed}, f"quotes:{settings.alpaca_feed}:{','.join(cleaned)}", 15)
+            payload = await self._json("/v2/stocks/snapshots", {"symbols": ",".join(missing), "feed": settings.alpaca_feed}, f"quotes:{settings.alpaca_feed}:{','.join(missing)}", 15)
             snapshots = payload.get("snapshots", payload)
             if not isinstance(snapshots, dict):
                 raise ValueError("Alpaca batch snapshots were malformed")
-            result: list[dict[str, Any]] = []
-            for symbol in cleaned:
+            result_by_symbol = {symbol: quote for symbol, quote in cached_quotes.items() if isinstance(quote, dict)}
+            for symbol in missing:
                 snapshot = snapshots.get(symbol)
                 if not isinstance(snapshot, dict):
-                    result.append(_unavailable_quote(symbol, settings.alpaca_feed, "No snapshot returned for this symbol"))
+                    result_by_symbol[symbol] = _unavailable_quote(symbol, settings.alpaca_feed, "No snapshot returned for this symbol")
                     continue
                 try:
-                    result.append(self._quote_from_snapshot(symbol, snapshot))
+                    quote = self._quote_from_snapshot(symbol, snapshot)
+                    result_by_symbol[symbol] = quote
+                    await _public_market_cache.put(f"quote:{settings.alpaca_feed}:{symbol}", 15, quote)
                 except (TypeError, ValueError, KeyError):
-                    result.append(_unavailable_quote(symbol, settings.alpaca_feed, "Snapshot did not contain a usable price"))
+                    result_by_symbol[symbol] = _unavailable_quote(symbol, settings.alpaca_feed, "Snapshot did not contain a usable price")
             _mark_provider_success("market")
-            return result
+            return [result_by_symbol[symbol] for symbol in cleaned]
         except (httpx.HTTPError, ValueError, TypeError, KeyError, AttributeError) as error:
             _mark_provider_failure("market")
-            logger.warning("alpaca_quote_batch_failed", extra={"symbols": len(cleaned), "reason": type(error).__name__})
-            return [_unavailable_quote(symbol, settings.alpaca_feed) for symbol in cleaned]
+            logger.warning("alpaca_quote_batch_failed", extra={"symbols": len(missing), "reason": type(error).__name__})
+            return [cached_quotes[symbol] if isinstance(cached_quotes[symbol], dict) else _unavailable_quote(symbol, settings.alpaca_feed) for symbol in cleaned]
 
     async def get_quote(self, symbol: str) -> dict[str, Any]:
         quotes = await self.get_quotes([symbol])
@@ -363,10 +477,17 @@ class AlpacaMarketProvider(MarketDataProvider):
     async def get_market_status(self) -> dict[str, Any]:
         settings = get_settings()
         try:
-            async with httpx.AsyncClient(timeout=settings.market_data_request_timeout_seconds) as client:
-                response = await client.get(f"{settings.alpaca_base_url.rstrip('/')}/v2/clock", headers=_headers())
+            async def load() -> dict[str, Any]:
+                client = await alpaca_http_client()
+                with measure("alpaca.clock"):
+                    response = await client.get(f"{settings.alpaca_base_url.rstrip('/')}/v2/clock", headers=_headers())
                 response.raise_for_status()
-                clock = response.json()
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    raise ValueError("Alpaca clock response was not an object")
+                return payload
+
+            clock = await _public_market_cache.get_or_load(f"clock:{settings.alpaca_feed}", 15, load)
             _mark_provider_success("market")
             return {"is_open": bool(clock.get("is_open")), "session": "Market Open" if clock.get("is_open") else "Market Closed", "provider": "Alpaca", "feed": settings.alpaca_feed, "freshness": _quality_for_feed(settings.alpaca_feed, datetime.now(timezone.utc).isoformat()), "data_quality": _quality_for_feed(settings.alpaca_feed, datetime.now(timezone.utc).isoformat()), "updated_at": datetime.now(timezone.utc).isoformat(), "next_open": clock.get("next_open"), "next_close": clock.get("next_close")}
         except (httpx.HTTPError, ValueError, TypeError) as error:
@@ -581,13 +702,14 @@ class AlpacaNewsProvider(DemoNewsProvider):
 
     async def _request_news(self, symbols: list[str]) -> dict[str, Any]:
         settings = get_settings()
-        async with httpx.AsyncClient(timeout=settings.market_data_request_timeout_seconds) as client:
+        client = await alpaca_http_client()
+        with measure("alpaca.news"):
             response = await client.get(f"{settings.alpaca_data_url.rstrip('/')}/v1beta1/news", headers=_headers(), params={"symbols": ",".join(symbols), "limit": 20, "sort": "desc"})
-            response.raise_for_status()
-            payload = response.json()
-            if not isinstance(payload, dict):
-                raise ValueError("Alpaca news response was not an object")
-            return payload
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Alpaca news response was not an object")
+        return payload
 
     async def provider_status(self) -> dict[str, Any]:
         return {"news_provider": "Alpaca", "news_status": _provider_connection("news", True), "last_successful_request": _provider_activity["news"]["last_successful_request"]}
@@ -664,13 +786,14 @@ class AlpacaOptionsProvider(DemoOptionsProvider):
 
     async def _request_chain(self, symbol: str) -> dict[str, Any]:
         settings = get_settings()
-        async with httpx.AsyncClient(timeout=settings.market_data_request_timeout_seconds) as client:
+        client = await alpaca_http_client()
+        with measure("alpaca.options"):
             response = await client.get(f"{settings.alpaca_data_url.rstrip('/')}/v1beta1/options/snapshots/{symbol}", headers=_headers(), params={"feed": settings.alpaca_options_feed, "limit": 100})
-            response.raise_for_status()
-            payload = response.json()
-            if not isinstance(payload, dict):
-                raise ValueError("Alpaca options response was not an object")
-            return payload
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Alpaca options response was not an object")
+        return payload
 
     async def provider_status(self) -> dict[str, Any]:
         return {"options_provider": "Alpaca", "options_feed": get_settings().alpaca_options_feed, "options_status": _provider_connection("options", True), "last_successful_request": _provider_activity["options"]["last_successful_request"]}
@@ -731,10 +854,11 @@ class DemoPaperBroker(BrokerProvider):
 class AlpacaPaperBroker(DemoPaperBroker):
     async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         settings = get_settings()
-        async with httpx.AsyncClient(timeout=10) as client:
+        client = await alpaca_http_client()
+        with measure("alpaca.paper"):
             response = await client.request(method, f"{settings.alpaca_base_url.rstrip('/')}{path}", headers=_headers(), **kwargs)
-            response.raise_for_status()
-            return response.json()
+        response.raise_for_status()
+        return response.json()
     async def account(self) -> dict[str, Any]:
         try:
             account = await self._request("GET", "/v2/account")

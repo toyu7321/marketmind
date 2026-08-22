@@ -4,12 +4,14 @@ import asyncio
 import hashlib
 import json
 import math
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,7 +24,11 @@ from .database import (
     SystemSetting, UserPreference, UserRiskProfile, UserSetting, get_db, init_db, utcnow,
 )
 from .indicators import technical_snapshot
-from .providers import EdgarSECProvider, analyze_evidence, market_provider, news_provider, options_provider, strategy_candidates
+from .observability import begin_request, cache_event, finish_request, latency_report, log_request, measure, reset_request, response_headers, safe_endpoint_name
+from .providers import (
+    EdgarSECProvider, analyze_evidence, close_provider_clients, market_provider, news_provider,
+    options_provider, public_market_cache_report, start_provider_clients, strategy_candidates,
+)
 from .risk import RiskLimits, evaluate
 from .schemas import BacktestRequest, PaperOrderRequest, PortfolioResponse, PredictionCreate, RiskRequest, SettingsUpdate
 from .scoring import MARKET_WEIGHTS, STOCK_WEIGHTS, score
@@ -35,10 +41,25 @@ from .security import (
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
-    yield
+    await start_provider_clients()
+    try:
+        yield
+    finally:
+        await close_provider_clients()
 
 
-app = FastAPI(title="MarketMind API", version="2.0.0", lifespan=lifespan, docs_url=None if get_settings().is_production else "/docs")
+class TimedJSONResponse(JSONResponse):
+    """Measure FastAPI's actual JSON serialization without touching response data."""
+
+    def render(self, content: Any) -> bytes:
+        with measure("serialization"):
+            return super().render(content)
+
+
+app = FastAPI(
+    title="MarketMind API", version="2.0.0", lifespan=lifespan,
+    docs_url=None if get_settings().is_production else "/docs", default_response_class=TimedJSONResponse,
+)
 settings = get_settings()
 app.add_middleware(
     CORSMiddleware,
@@ -51,7 +72,18 @@ app.add_middleware(
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
-    response = await call_next(request)
+    token = begin_request()
+    response: Response | None = None
+    try:
+        response = await call_next(request)
+        endpoint = safe_endpoint_name(request.url.path)
+        profile, total_ms = finish_request(endpoint)
+        for name, value in response_headers(profile, total_ms).items():
+            response.headers.setdefault(name, value)
+        log_request(endpoint, profile, total_ms)
+    finally:
+        reset_request(token)
+    assert response is not None
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
@@ -82,6 +114,9 @@ DEFAULT_USER_SETTINGS: dict[str, Any] = {
     "automation": {"premarket": True, "session": True, "postmarket": True},
     "ai": {"model": settings.openai_model, "mode": "Top 5 only"},
 }
+_global_defaults_cache: tuple[float, dict[str, Any]] | None = None
+_global_defaults_lock = asyncio.Lock()
+_technical_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
 
 def _merge(defaults: dict[str, Any], saved: dict[str, Any] | None) -> dict[str, Any]:
@@ -96,15 +131,31 @@ def _merge(defaults: dict[str, Any], saved: dict[str, Any] | None) -> dict[str, 
 
 async def global_defaults(db: AsyncSession) -> dict[str, Any]:
     # The original `runtime_settings` row is preserved as a backward-compatible global default.
-    legacy = await db.get(UserSetting, "runtime_settings")
-    configured = await db.get(SystemSetting, "runtime_defaults")
-    merged = _merge(DEFAULT_USER_SETTINGS, legacy.value if legacy else None)
-    return _merge(merged, configured.value if configured else None)
+    global _global_defaults_cache
+    now = time.monotonic()
+    cached = _global_defaults_cache
+    if cached and cached[0] > now:
+        cache_event("runtime_defaults", "hit")
+        return _merge(cached[1], None)
+    async with _global_defaults_lock:
+        cached = _global_defaults_cache
+        if cached and cached[0] > time.monotonic():
+            cache_event("runtime_defaults", "hit")
+            return _merge(cached[1], None)
+        cache_event("runtime_defaults", "miss")
+        with measure("database.runtime_defaults"):
+            legacy = await db.get(UserSetting, "runtime_settings")
+            configured = await db.get(SystemSetting, "runtime_defaults")
+        merged = _merge(DEFAULT_USER_SETTINGS, legacy.value if legacy else None)
+        result = _merge(merged, configured.value if configured else None)
+        _global_defaults_cache = (time.monotonic() + 120, result)
+        return _merge(result, None)
 
 
 async def runtime_settings(db: AsyncSession, user_id: str) -> dict[str, Any]:
     defaults = await global_defaults(db)
-    row = (await db.execute(select(UserPreference).where(UserPreference.user_id == user_id, UserPreference.key == "runtime_settings"))).scalar_one_or_none()
+    with measure("database.user_preferences"):
+        row = (await db.execute(select(UserPreference).where(UserPreference.user_id == user_id, UserPreference.key == "runtime_settings"))).scalar_one_or_none()
     return _merge(defaults, row.value if row else None)
 
 
@@ -149,13 +200,42 @@ def _technical_from_bars(bars: list[dict[str, Any]]) -> dict[str, Any] | None:
     if len(bars) < 50:
         return None
     try:
-        return technical_snapshot([row["close"] for row in bars], [row["high"] for row in bars], [row["low"] for row in bars], [row["volume"] for row in bars])
+        fingerprint = hashlib.sha256(json.dumps([
+            (row["time"], row["close"], row["high"], row["low"], row["volume"]) for row in bars
+        ], separators=(",", ":"), default=str).encode()).hexdigest()
+        cached = _technical_cache.get(fingerprint)
+        if cached and cached[0] > time.monotonic():
+            cache_event("technicals", "hit")
+            return cached[1]
+        cache_event("technicals", "miss")
+        with measure("computation.technicals"):
+            result = technical_snapshot([row["close"] for row in bars], [row["high"] for row in bars], [row["low"] for row in bars], [row["volume"] for row in bars])
+        if len(_technical_cache) >= 512:
+            _technical_cache.pop(next(iter(_technical_cache)))
+        _technical_cache[fingerprint] = (time.monotonic() + 900, result)
+        return result
     except (KeyError, TypeError, ValueError, IndexError):
         return None
 
 
 def _unavailable_technical() -> dict[str, Any]:
     return {"rsi": None, "macd": None, "ema20": None, "ema50": None, "volatility": None, "trend": "unavailable", "support": None, "resistance": None, "volume_spike": None}
+
+
+async def _stock_histories(provider: Any, symbol: str, range_name: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Reuse the 260-day indicator history for daily 3M/6M charts.
+
+    The old path issued two overlapping daily-bar requests for the default Stock
+    Intel view. Intraday ranges retain their dedicated aggregation.
+    """
+    if range_name in {"3M", "6M"}:
+        technical = await provider.get_bars(symbol, 260)
+        calendar_days = 93 if range_name == "3M" else 186
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=calendar_days)).date().isoformat()
+        chart = [bar for bar in technical if str(bar.get("time", "")) >= cutoff]
+        return technical, chart
+    technical, chart = await asyncio.gather(provider.get_bars(symbol, 260), provider.get_bars_for_range(symbol, range_name))
+    return technical, chart
 
 
 def _has_number(value: Any) -> bool:
@@ -184,7 +264,8 @@ def _stock_score(quote: dict[str, Any], tech: dict[str, Any] | None, market_scor
         "Market Environment": f"Deterministic Market Score is {market_score}/100.",
         "Risk": "Risk engine retains final authority over every order proposal.",
     }
-    return score(values, weights, reasons)
+    with measure("computation.stock_score"):
+        return score(values, weights, reasons)
 
 
 def _demo_filings() -> list[dict[str, Any]]:
@@ -199,7 +280,8 @@ def _demo_filings() -> list[dict[str, Any]]:
 async def health(response: Response, db: AsyncSession = Depends(get_db)):
     database = "available"
     try:
-        await db.execute(text("SELECT 1"))
+        with measure("database.health"):
+            await db.execute(text("SELECT 1"))
     except Exception:
         database = "unavailable"
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
@@ -214,6 +296,7 @@ async def health(response: Response, db: AsyncSession = Depends(get_db)):
         **news_status,
         **options_status,
         "live_trading": "locked",
+        "performance": {"latency": latency_report(), "public_market_cache": public_market_cache_report()},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -257,8 +340,9 @@ async def dashboard(principal: Principal = Depends(require_authenticated_user), 
         quote = lookup.get(symbol)
         if quote is None:
             continue
-        result = _stock_score(quote, _technical_from_bars(watch_bars.get(symbol, [])), market.score if market else 50, config["stock_weights"])
-        watchlist.append({**quote, "score": result.score if result else None, "trend": (_technical_from_bars(watch_bars.get(symbol, [])) or {}).get("trend", quote.get("trend", "Unavailable"))})
+        technical = _technical_from_bars(watch_bars.get(symbol, []))
+        result = _stock_score(quote, technical, market.score if market else 50, config["stock_weights"])
+        watchlist.append({**quote, "score": result.score if result else None, "trend": (technical or {}).get("trend", quote.get("trend", "Unavailable"))})
     sectors = [{
         "symbol": symbol, "name": {"XLK": "Technology", "XLF": "Financials", "XLE": "Energy", "XLV": "Healthcare", "SMH": "Semiconductors", "SOXX": "Semiconductors"}.get(symbol, symbol),
         "change": lookup.get(symbol, {}).get("change_percent"), "relative_strength": round(max(0, min(100, 50 + lookup[symbol]["change_percent"] * 15)), 1) if _has_number(lookup.get(symbol, {}).get("change_percent")) else None, "freshness": lookup.get(symbol, {}).get("freshness", "UNAVAILABLE"),
@@ -298,10 +382,11 @@ async def stock(symbol: str, range_name: str = Query(default="3M", alias="range"
     if not symbol.isalnum() or len(symbol) > 8:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid symbol")
     config, provider = await runtime_settings(db, principal.user.id), market_provider()
-    quote, technical_bars, chart_bars, news_result, provider_status, filings = await asyncio.gather(
-        provider.get_quote(symbol), provider.get_bars(symbol, 260), provider.get_bars_for_range(symbol, range_name), news_provider().get_news([symbol]), provider.provider_status(),
+    quote, histories, news_result, provider_status, filings = await asyncio.gather(
+        provider.get_quote(symbol), _stock_histories(provider, symbol, range_name), news_provider().get_news([symbol]), provider.provider_status(),
         EdgarSECProvider().filings_for_symbol(symbol),
     )
+    technical_bars, chart_bars = histories
     news_mode, all_news = news_result
     tech = _technical_from_bars(technical_bars)
     result = _stock_score(quote, tech, 50, config["stock_weights"])
@@ -325,8 +410,8 @@ async def stock(symbol: str, range_name: str = Query(default="3M", alias="range"
 async def news(principal: Principal = Depends(require_authenticated_user), db: AsyncSession = Depends(get_db)):
     config = await runtime_settings(db, principal.user.id)
     provider = news_provider()
-    mode, items = await provider.get_news(config["watchlist"])
-    return {"mode": mode, "provider_status": await provider.provider_status(), "items": items, "message": "Alpaca News did not return a feed for this account or request." if mode == "UNAVAILABLE" else None}
+    (mode, items), provider_status = await asyncio.gather(provider.get_news(config["watchlist"]), provider.provider_status())
+    return {"mode": mode, "provider_status": provider_status, "items": items, "message": "Alpaca News did not return a feed for this account or request." if mode == "UNAVAILABLE" else None}
 
 
 @app.get("/api/options/{symbol}")
@@ -347,10 +432,12 @@ async def options(symbol: str, _: Principal = Depends(require_authenticated_user
             market.get_quote(symbol), options_data.get_chain(symbol, None), options_data.provider_status(),
         )
         source, chain = option_result
-    valid_iv = [row["iv"] for row in chain if row.get("iv") is not None]
-    call_volume = sum(row.get("volume") or 0 for row in chain if row["type"] == "CALL")
-    put_volume = sum(row.get("volume") or 0 for row in chain if row["type"] == "PUT")
-    return {"mode": source, "symbol": symbol, "spot": quote.get("price"), "quote_quality": quote.get("freshness"), "provider_status": options_status, "put_call_ratio": round(put_volume / call_volume, 2) if call_volume else None, "iv_rank": round(sum(valid_iv) / len(valid_iv), 1) if valid_iv else None, "chain": chain, "strategies": strategy_candidates(quote["price"], chain) if _has_number(quote.get("price")) else [], "message": "Live options data is unavailable for the configured Alpaca account/feed. No synthetic contracts are shown." if source == "UNAVAILABLE" else None}
+    with measure("computation.options"):
+        valid_iv = [row["iv"] for row in chain if row.get("iv") is not None]
+        call_volume = sum(row.get("volume") or 0 for row in chain if row["type"] == "CALL")
+        put_volume = sum(row.get("volume") or 0 for row in chain if row["type"] == "PUT")
+        strategies = strategy_candidates(quote["price"], chain) if _has_number(quote.get("price")) else []
+    return {"mode": source, "symbol": symbol, "spot": quote.get("price"), "quote_quality": quote.get("freshness"), "provider_status": options_status, "put_call_ratio": round(put_volume / call_volume, 2) if call_volume else None, "iv_rank": round(sum(valid_iv) / len(valid_iv), 1) if valid_iv else None, "chain": chain, "strategies": strategies, "message": "Live options data is unavailable for the configured Alpaca account/feed. No synthetic contracts are shown." if source == "UNAVAILABLE" else None}
 
 
 @app.post("/api/risk/evaluate", dependencies=[Depends(rate_limit("risk", 30))])
@@ -434,20 +521,22 @@ def _portfolio_number(value: Any, fallback: float = 0.0) -> float:
 @app.get("/api/portfolio", response_model=PortfolioResponse)
 async def portfolio(principal: Principal = Depends(require_authenticated_user), db: AsyncSession = Depends(get_db)):
     account = await _personal_portfolio(db, principal.user.id)
-    positions = (await db.execute(select(PortfolioPosition).where(PortfolioPosition.portfolio_id == account.id))).scalars().all()
+    with measure("database.portfolio_positions"):
+        positions = (await db.execute(select(PortfolioPosition).where(PortfolioPosition.portfolio_id == account.id))).scalars().all()
     provider = market_provider()
     output: list[dict[str, Any]] = []
-    for row in positions:
-        symbol = str(row.symbol or "").strip().upper()
-        if not symbol:
-            continue
+    valid_positions = [(row, str(row.symbol or "").strip().upper()) for row in positions]
+    valid_positions = [(row, symbol) for row, symbol in valid_positions if symbol]
+    symbols = [symbol for _, symbol in valid_positions]
+    try:
+        quotes = await provider.get_quotes(symbols) if hasattr(provider, "get_quotes") else await asyncio.gather(*(provider.get_quote(symbol) for symbol in symbols))
+    except Exception:
+        quotes = [{} for _ in symbols]
+    quote_by_symbol = {str(quote.get("symbol", "")).upper(): quote for quote in quotes if isinstance(quote, dict)}
+    for row, symbol in valid_positions:
         quantity = _portfolio_number(row.quantity)
         average_cost = _portfolio_number(row.average_cost)
-        try:
-            quote = await provider.get_quote(symbol)
-        except Exception:
-            quote = {}
-        quote = quote if isinstance(quote, dict) else {}
+        quote = quote_by_symbol.get(symbol, {})
         price = _portfolio_number(quote.get("price"), average_cost)
         daily_change = _portfolio_number(quote.get("change"))
         value = round(quantity * price, 2)

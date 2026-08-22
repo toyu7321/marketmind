@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import Settings, get_settings
 from .database import ActiveSession, AuditEvent, Base, SystemSetting, User, get_db, utcnow
+from .observability import measure
 
 
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -185,6 +186,34 @@ class SlidingWindowRateLimiter:
 rate_limiter = SlidingWindowRateLimiter()
 
 
+class SessionActivityGate:
+    """Throttle non-security-critical session heartbeat writes per process.
+
+    JWT validation, user-active checks, and session-revocation checks still run
+    for every request. Only the audit/session "last seen" bookkeeping is
+    coalesced for a minute to avoid a write transaction for each panel fetch.
+    """
+
+    def __init__(self, interval_seconds: int = 60) -> None:
+        self._interval_seconds = interval_seconds
+        self._recent: dict[tuple[str, str], float] = {}
+        self._lock = asyncio.Lock()
+
+    async def should_touch(self, user_id: str, session_id: str) -> bool:
+        now = time.monotonic()
+        key = (user_id, session_id or "sessionless")
+        async with self._lock:
+            if self._recent.get(key, 0) > now:
+                return False
+            self._recent[key] = now + self._interval_seconds
+            if len(self._recent) > 2_000:
+                self._recent = {entry: expires for entry, expires in self._recent.items() if expires > now}
+            return True
+
+
+session_activity_gate = SessionActivityGate()
+
+
 async def get_owned_resource(db: AsyncSession, model: type[T], resource_id: str, user_id: str) -> T:
     resource = await db.get(model, resource_id)
     if resource is None or getattr(resource, "user_id", None) != user_id:
@@ -212,40 +241,45 @@ async def require_authenticated_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
     db: AsyncSession = Depends(get_db),
 ) -> Principal:
-    settings = get_settings()
-    if not settings.auth_ready:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Authentication is not configured.")
-    if credentials is None or credentials.scheme.lower() != "bearer":
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication is required.", headers={"WWW-Authenticate": "Bearer"})
-    claims = await jwks_verifier.verify(credentials.credentials, settings)
-    subject = str(claims.get("sub", ""))
-    try:
-        UUID(subject)
-    except (ValueError, TypeError):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authentication token.")
-    user = (await db.execute(select(User).where(User.auth_subject == subject))).scalar_one_or_none()
-    if user is None or not user.is_active:
-        await write_audit(db, request, event_type="LOGIN_FAILED", resource="session", result="DENIED", safe_metadata={"reason": "unknown_or_inactive_user"})
-        await db.commit()
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account access is unavailable.")
-    issued_at = datetime.fromtimestamp(int(claims["iat"]), tz=timezone.utc)
-    revoked_at = user.sessions_revoked_at
-    if revoked_at and revoked_at.tzinfo is None:
-        revoked_at = revoked_at.replace(tzinfo=timezone.utc)
-    if revoked_at and issued_at <= revoked_at:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session has been revoked.")
-    principal = Principal(
-        user=user,
-        subject=subject,
-        email=str(claims.get("email") or user.email),
-        aal=str(claims.get("aal") or "aal1"),
-        session_id=str(claims.get("session_id") or claims.get("sid") or ""),
-        claims=claims,
-    )
-    user.last_login_at = utcnow()
-    await _record_session(db, request, principal)
-    await db.commit()
-    return principal
+    with measure("authentication"):
+        settings = get_settings()
+        if not settings.auth_ready:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Authentication is not configured.")
+        if credentials is None or credentials.scheme.lower() != "bearer":
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication is required.", headers={"WWW-Authenticate": "Bearer"})
+        with measure("authentication.jwt"):
+            claims = await jwks_verifier.verify(credentials.credentials, settings)
+        subject = str(claims.get("sub", ""))
+        try:
+            UUID(subject)
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authentication token.")
+        with measure("database.auth_user"):
+            user = (await db.execute(select(User).where(User.auth_subject == subject))).scalar_one_or_none()
+        if user is None or not user.is_active:
+            await write_audit(db, request, event_type="LOGIN_FAILED", resource="session", result="DENIED", safe_metadata={"reason": "unknown_or_inactive_user"})
+            await db.commit()
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account access is unavailable.")
+        issued_at = datetime.fromtimestamp(int(claims["iat"]), tz=timezone.utc)
+        revoked_at = user.sessions_revoked_at
+        if revoked_at and revoked_at.tzinfo is None:
+            revoked_at = revoked_at.replace(tzinfo=timezone.utc)
+        if revoked_at and issued_at <= revoked_at:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session has been revoked.")
+        principal = Principal(
+            user=user,
+            subject=subject,
+            email=str(claims.get("email") or user.email),
+            aal=str(claims.get("aal") or "aal1"),
+            session_id=str(claims.get("session_id") or claims.get("sid") or ""),
+            claims=claims,
+        )
+        if await session_activity_gate.should_touch(principal.user.id, principal.session_id):
+            user.last_login_at = utcnow()
+            with measure("database.auth_session"):
+                await _record_session(db, request, principal)
+                await db.commit()
+        return principal
 
 
 

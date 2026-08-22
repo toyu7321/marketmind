@@ -75,6 +75,9 @@ def test_health_is_public_but_market_data_fails_closed_without_auth_configuratio
         health = client.get("/api/health")
         assert health.status_code == 200
         assert health.json()["authentication"] == "not_configured"
+        assert "total;dur=" in health.headers["server-timing"]
+        assert "serialization;dur=" in health.headers["server-timing"]
+        assert "performance" in health.json()
         assert client.get("/api/dashboard").status_code == 503
         assert client.get("/api/settings").status_code == 503
 

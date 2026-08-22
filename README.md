@@ -138,6 +138,9 @@ Do not commit `.env`, database files, token files, or provider keys. See [docs/S
 
 ## Validation
 
+See [latency profiling](docs/LATENCY.md) for warm-path timing headers, cache
+diagnostics, and the distinction between Render cold starts and endpoint work.
+
 ```powershell
 cd backend
 pytest -q

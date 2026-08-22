@@ -9,7 +9,8 @@ import pytest
 from app.config import get_settings
 from app import main as main_module
 from app.indicators import technical_snapshot
-from app.providers import AlpacaMarketProvider
+import app.providers as providers_module
+from app.providers import AlpacaMarketProvider, _PublicTTLCache
 
 
 def _bar(index: int) -> dict[str, object]:
@@ -149,3 +150,113 @@ async def test_live_options_quote_chain_and_status_start_in_parallel(monkeypatch
 
     assert set(started) == {"quote", "chain", "status"}
     assert payload["mode"] == "LIVE"
+
+
+@pytest.mark.asyncio
+async def test_public_market_cache_coalesces_duplicate_upstream_loads_and_reports_hits():
+    cache = _PublicTTLCache()
+    calls = 0
+    started = asyncio.Event()
+
+    async def loader():
+        nonlocal calls
+        calls += 1
+        started.set()
+        await asyncio.sleep(0.01)
+        return {"value": 1}
+
+    first = asyncio.create_task(cache.get_or_load("quotes:iex:SPY", 30, loader))
+    await started.wait()
+    second = asyncio.create_task(cache.get_or_load("quotes:iex:SPY", 30, loader))
+    assert await first == await second == {"value": 1}
+    assert calls == 1
+    assert await cache.get_or_load("quotes:iex:SPY", 30, loader) == {"value": 1}
+    report = cache.report()["outcomes"]
+    assert report["quotes:miss"] == 1
+    assert report["quotes:coalesced"] == 1
+    assert report["quotes:hit"] == 1
+
+
+@pytest.mark.asyncio
+async def test_stock_intel_reuses_daily_indicator_history_for_default_chart():
+    calls: list[tuple[str, int]] = []
+    bars = [{"time": (datetime.now(timezone.utc) - timedelta(days=index)).date().isoformat(), "close": 100 + index} for index in range(260)]
+
+    class Provider:
+        async def get_bars(self, symbol: str, days: int):
+            calls.append((symbol, days))
+            return bars
+
+        async def get_bars_for_range(self, *_args):
+            raise AssertionError("3M should reuse daily indicator history")
+
+    technical, chart = await main_module._stock_histories(Provider(), "NVDA", "3M")
+    assert calls == [("NVDA", 260)]
+    assert technical == bars
+    assert chart
+
+
+@pytest.mark.asyncio
+async def test_alpaca_json_uses_the_shared_keep_alive_client_and_cache(monkeypatch):
+    requests: list[str] = []
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"snapshots": {}}
+
+    class Client:
+        async def get(self, url, **_kwargs):
+            requests.append(url)
+            return Response()
+
+    shared = Client()
+
+    async def get_shared_client():
+        return shared
+
+    monkeypatch.setattr(providers_module, "alpaca_http_client", get_shared_client)
+    provider = AlpacaMarketProvider()
+    cache_key = f"quotes:iex:pool-{datetime.now(timezone.utc).timestamp()}"
+    await provider._json("/v2/stocks/snapshots", {"symbols": "SPY"}, cache_key, 30)
+    await provider._json("/v2/stocks/snapshots", {"symbols": "SPY"}, cache_key, 30)
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_batch_quote_warms_single_symbol_stock_intel_request(monkeypatch):
+    provider = AlpacaMarketProvider()
+    calls = 0
+
+    async def snapshots(_path, params, *_args):
+        nonlocal calls
+        calls += 1
+        now = datetime.now(timezone.utc).isoformat()
+        return {"snapshots": {
+            symbol: {"latestTrade": {"p": 100, "t": now}, "prevDailyBar": {"c": 99}}
+            for symbol in str(params["symbols"]).split(",")
+        }}
+
+    monkeypatch.setattr(provider, "_json", snapshots)
+    initial = await provider.get_quotes(["LATENCY1", "LATENCY2"])
+    repeated = await provider.get_quote("LATENCY1")
+    assert calls == 1
+    assert initial[0]["symbol"] == repeated["symbol"] == "LATENCY1"
+
+
+def test_technical_snapshot_is_reused_when_public_bar_source_is_unchanged(monkeypatch):
+    calls = 0
+    main_module._technical_cache.clear()
+    bars = [{"time": f"2026-01-{index + 1:02d}", "close": 100 + index, "high": 102 + index, "low": 99 + index, "volume": 1_000_000} for index in range(60)]
+
+    def snapshot(*_args):
+        nonlocal calls
+        calls += 1
+        return {"rsi": 55}
+
+    monkeypatch.setattr(main_module, "technical_snapshot", snapshot)
+    assert main_module._technical_from_bars(bars) == {"rsi": 55}
+    assert main_module._technical_from_bars(bars) == {"rsi": 55}
+    assert calls == 1

@@ -1,9 +1,10 @@
 'use client';
 
-import {useEffect, useState} from 'react';
-import useSWR, {mutate as mutateAll} from 'swr';
+import {useEffect, useRef, useState} from 'react';
+import useSWR, {mutate as mutateAll, preload} from 'swr';
 
 import {api, ApiError} from './api';
+import {recordClientTiming} from './performance';
 import {authConfigured, createSupabaseBrowserClient} from './supabase/client';
 
 type CacheScope = 'market' | 'session';
@@ -41,6 +42,7 @@ export function cacheKeyForPath(scope: string | null, path: string, policy = dat
 
 let knownSessionScope: string | null | undefined;
 let sessionScopeRequest: Promise<string | null> | undefined;
+const observedClientKeys = new Set<string>();
 
 async function loadSessionScope(): Promise<string | null> {
   if (knownSessionScope !== undefined) return knownSessionScope;
@@ -87,7 +89,19 @@ export function useApiData<T>(path: string, override?: Partial<DataPolicy>) {
     revalidateIfStale: true,
     keepPreviousData: true,
   });
+  const lastRendered = useRef<T | undefined>(undefined);
   const [waking, setWaking] = useState(false);
+
+  useEffect(() => {
+    if (!key || response.data === undefined || lastRendered.current === response.data) return;
+    lastRendered.current = response.data;
+    const cacheKey = JSON.stringify(key);
+    const cache = observedClientKeys.has(cacheKey) ? (response.isValidating ? 'stale-refresh' : 'hit') : 'miss';
+    observedClientKeys.add(cacheKey);
+    const report = () => recordClientTiming({kind: 'render_complete', path, cache});
+    const frame = window.requestAnimationFrame(report);
+    return () => window.cancelAnimationFrame(frame);
+  }, [key, path, response.data, response.isValidating]);
 
   useEffect(() => {
     if (!response.isLoading) {
@@ -105,5 +119,15 @@ export function useApiData<T>(path: string, override?: Partial<DataPolicy>) {
 export function clearClientDataCache() {
   knownSessionScope = undefined;
   sessionScopeRequest = undefined;
+  observedClientKeys.clear();
   return mutateAll(() => true, undefined, {revalidate: false});
+}
+
+/** Warm a likely next route in the in-memory, session-scoped SWR cache only. */
+export async function prefetchApiData(path: string) {
+  const policy = dataPolicyForPath(path);
+  const scope = policy.scope === 'market' ? 'market' : await loadSessionScope();
+  const key = cacheKeyForPath(scope, path, policy);
+  if (!key) return;
+  void preload(key, () => api(path)).catch(() => undefined);
 }
