@@ -2,6 +2,17 @@
 
 This runbook prioritizes protecting customer accounts and preserving evidence. Do not attempt to diagnose an incident by enabling trading or weakening authentication.
 
+## Durable hold and reconciliation response
+
+For market-data integrity, loss/drawdown, broker timeout, duplicate-intent, or
+position/order mismatch events, leave the generated `trading_holds` and
+outbox/intent records intact. The hold generation invalidates queued work.
+Capture the deterministic client-order ID, mark the outcome `UNKNOWN` or
+`RECONCILING`, and query the broker before any future retry. Do not delete or
+re-submit an ambiguous intent. A named AAL2 administrator must document a
+release only after fresh reconciliation; the current release has no automated
+hold release or dispatch worker.
+
 ## First 15 minutes: contain and preserve
 
 1. Have an AAL2 administrator activate the global kill switch. Keep `ENABLE_REMOTE_PAPER_ORDERS=false` and `ENABLE_LIVE_TRADING=false`.

@@ -18,7 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import Settings, get_settings
-from .database import ActiveSession, AuditEvent, Base, SystemSetting, User, get_db, utcnow
+from .database import ActiveSession, AuditEvent, Base, SystemSetting, TradingControlState, TradingHold, User, get_db, utcnow
 from .observability import measure
 from .redaction import redact
 
@@ -164,11 +164,47 @@ async def _record_session(db: AsyncSession, request: Request, principal: Princip
 
 
 class SlidingWindowRateLimiter:
+    """Shared Redis limiter with an explicit single-instance fallback.
+
+    The fallback is retained for the read-only research UI and local tests. It
+    is observable and cannot satisfy a future remote-execution deployment.
+    """
+
     def __init__(self) -> None:
         self._buckets: dict[tuple[str, str], deque[float]] = defaultdict(deque)
         self._lock = asyncio.Lock()
+        self._redis: Any | None = None
+        self._redis_url = ""
+        self._shared_failures = 0
+
+    async def _shared_check(self, scope: str, subject: str, *, limit: int, window_seconds: int) -> bool:
+        settings = get_settings()
+        if not settings.redis_url:
+            return False
+        try:
+            if self._redis is None or self._redis_url != settings.redis_url:
+                from redis.asyncio import from_url  # optional until REDIS_URL is configured
+                self._redis = from_url(settings.redis_url, encoding="utf-8", decode_responses=True, socket_connect_timeout=1, socket_timeout=1)
+                self._redis_url = settings.redis_url
+            key = f"marketmind:rl:{scope}:{subject}"
+            # INCR+EXPIRE is atomic; it is enough for fixed-window protection
+            # and gives every Vercel/Render instance the same quota.
+            count = await self._redis.incr(key)
+            if count == 1:
+                await self._redis.expire(key, window_seconds)
+            if count > limit:
+                ttl = await self._redis.ttl(key)
+                raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Too many requests. Please try again shortly.", headers={"Retry-After": str(max(1, ttl))})
+            return True
+        except HTTPException:
+            raise
+        except Exception:
+            self._shared_failures += 1
+            return False
 
     async def check(self, scope: str, subject: str, *, limit: int, window_seconds: int) -> None:
+        if await self._shared_check(scope, subject, limit=limit, window_seconds=window_seconds):
+            return
         now = time.monotonic()
         key = (scope, subject)
         async with self._lock:
@@ -182,6 +218,13 @@ class SlidingWindowRateLimiter:
                     headers={"Retry-After": str(window_seconds)},
                 )
             bucket.append(now)
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "backend": "redis" if self._redis is not None else "process-local-fallback",
+            "shared_configured": bool(get_settings().redis_url),
+            "shared_failures": self._shared_failures,
+        }
 
 
 rate_limiter = SlidingWindowRateLimiter()
@@ -235,6 +278,17 @@ async def trading_allowed(db: AsyncSession, principal: Principal) -> None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Trading is disabled by the user safety switch.")
     if not settings.paper_order_submission_enabled:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Paper order submission is disabled by server policy.")
+    if settings.rate_limit_require_shared_for_execution and not settings.redis_url:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Remote execution is blocked until shared rate limiting is configured.")
+    control = await db.get(TradingControlState, "global")
+    if control and control.global_hold_active:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Trading is paused by a durable safety hold.")
+    hold = (await db.execute(select(TradingHold).where(
+        TradingHold.active.is_(True),
+        (TradingHold.scope == "GLOBAL") | (TradingHold.user_id == principal.user.id),
+    ).limit(1))).scalar_one_or_none()
+    if hold is not None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Trading is paused by a durable risk or reconciliation hold.")
 
 
 async def require_authenticated_user(
@@ -261,21 +315,29 @@ async def require_authenticated_user(
             await write_audit(db, request, event_type="LOGIN_FAILED", resource="session", result="DENIED", safe_metadata={"reason": "unknown_or_inactive_user"})
             await db.commit()
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account access is unavailable.")
+        session_id = str(claims.get("session_id") or claims.get("sid") or "")
+        if not session_id:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="A provider session identifier is required.")
         issued_at = datetime.fromtimestamp(int(claims["iat"]), tz=timezone.utc)
         revoked_at = user.sessions_revoked_at
         if revoked_at and revoked_at.tzinfo is None:
             revoked_at = revoked_at.replace(tzinfo=timezone.utc)
-        if revoked_at and issued_at <= revoked_at:
+        if revoked_at and issued_at <= revoked_at and session_id != user.sessions_revocation_exempt_session_id:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session has been revoked.")
+        session = (await db.execute(select(ActiveSession).where(
+            ActiveSession.user_id == user.id, ActiveSession.provider_session_id == session_id,
+        ))).scalar_one_or_none()
+        if session is not None and session.revoked_at is not None:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session has been revoked.")
         principal = Principal(
             user=user,
             subject=subject,
             email=str(claims.get("email") or user.email),
             aal=str(claims.get("aal") or "aal1"),
-            session_id=str(claims.get("session_id") or claims.get("sid") or ""),
+            session_id=session_id,
             claims=claims,
         )
-        if await session_activity_gate.should_touch(principal.user.id, principal.session_id):
+        if session is None or await session_activity_gate.should_touch(principal.user.id, principal.session_id):
             user.last_login_at = utcnow()
             with measure("database.auth_session"):
                 await _record_session(db, request, principal)

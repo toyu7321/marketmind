@@ -93,7 +93,7 @@ Copy `.env.example` and keep secrets only in the backend host configuration.
 | `MARKETMIND_ENV` | backend | `development` locally; `production` in the cloud |
 | `DATABASE_URL` | backend | SQLite locally or `postgresql+asyncpg://...` in production |
 | `FRONTEND_ORIGIN`, `CORS_ORIGINS` | backend | Explicit HTTPS frontend origin(s) in production |
-| `OPENAI_API_KEY`, `ALPACA_*`, `SEC_USER_AGENT` | backend | Optional provider credentials only |
+| `OPENAI_API_KEY`, `ALPACA_MARKET_DATA_*`, `SEC_USER_AGENT` | backend | Optional provider credentials only; market-data credentials must not be order-capable |
 | `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY` | backend | Identity provider URL and public key used to verify browser-issued access tokens |
 | `SUPABASE_SECRET_KEY` | backend only | Server-only invitation capability; never expose it to Vercel/browser code |
 | `AUDIT_IP_HMAC_SECRET` | backend | Required production secret for privacy-preserving audit IP hashing |
@@ -109,8 +109,8 @@ Copy `.env.example` and keep secrets only in the backend host configuration.
 MarketMind uses Alpaca only from the FastAPI backend. Add the following values to the **Render backend** environment; do not add them to Vercel, `NEXT_PUBLIC_*`, Supabase, browser storage, or GitHub:
 
 ```text
-ALPACA_API_KEY=...
-ALPACA_SECRET_KEY=...
+ALPACA_MARKET_DATA_API_KEY=...
+ALPACA_MARKET_DATA_SECRET_KEY=...
 ALPACA_DATA_URL=https://data.alpaca.markets
 ALPACA_FEED=iex
 ALPACA_OPTIONS_FEED=indicative
@@ -119,6 +119,13 @@ MARKET_DATA_STALE_SECONDS=900
 ENABLE_LIVE_TRADING=false
 ENABLE_REMOTE_PAPER_ORDERS=false
 ```
+
+Use a market-data-only Alpaca credential in the Render API runtime. Do not put
+an order-capable broker key in the API or Vercel. Future executor-only broker
+credentials (`EXECUTOR_BROKER_API_KEY`, `EXECUTOR_BROKER_SECRET_KEY`) are not
+used or configured by this release. `REDIS_URL` is optional for research UI
+rate limiting, but is a hard prerequisite before any future remote-execution
+tier could be reviewed; the current release remains non-operational for orders.
 
 `IEX` is a live but exchange-limited stock feed. If the account has the relevant entitlement, set `ALPACA_FEED=sip`; use `delayed_sip` only when intentionally accepting delayed data. MarketMind displays **LIVE**, **IEX**, **DELAYED**, **STALE**, **DEMO**, or **UNAVAILABLE** next to public market data. It does not merge a failed Alpaca response with synthetic values: no credentials select the explicit demo provider, while a configured provider failure renders an unavailable state.
 

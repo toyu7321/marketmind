@@ -92,8 +92,11 @@ class TradeIntent(StrictModel):
     """A bounded signal contract, never a broker instruction or an AI command."""
 
     intent_id: UUID = Field(default_factory=uuid4)
-    symbol: str = Field(min_length=1, max_length=8, pattern=r"^[A-Za-z0-9]+$")
+    symbol: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
     side: Literal["BUY", "SELL"]
+    # Compatibility hint only. Authoritative classification always comes from
+    # server-side InstrumentMetadata and this value is never used by execution
+    # risk controls.
     asset_type: Literal["STOCK", "ETF", "LEVERAGED_ETF", "OPTION"] = "STOCK"
     strategy_id: str = Field(min_length=3, max_length=80, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
     confidence: float = Field(ge=0, le=1)
@@ -242,18 +245,20 @@ class SettingsUpdate(StrictModel):
 
 
 class PaperOrderRequest(StrictModel):
-    symbol: str = Field(min_length=1, max_length=8, pattern=r"^[A-Za-z0-9]+$")
+    symbol: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
     quantity: float = Field(gt=0, le=10_000_000)
     side: Literal["BUY", "SELL"]
     order_type: Literal["market", "limit"] = "limit"
     time_in_force: Literal["day", "gtc"] = "day"
     limit_price: float | None = Field(default=None, gt=0, le=10_000_000)
-    estimated_price: float = Field(gt=0, le=10_000_000)
-    current_exposure: float = Field(default=0, ge=0, le=100_000_000)
-    sector_exposure: float = Field(default=0, ge=0, le=100_000_000)
-    daily_pnl: float = Field(default=0, ge=-100_000_000, le=100_000_000)
-    liquidity: float = Field(default=10_000_000, ge=0, le=10_000_000_000)
-    event_risk: bool = False
+    # Legacy display/simulation fields. They remain parseable for the current
+    # client release but are deliberately ignored by canonical risk decisions.
+    estimated_price: float | None = Field(default=None, gt=0, le=10_000_000)
+    current_exposure: float | None = Field(default=None, ge=0, le=100_000_000)
+    sector_exposure: float | None = Field(default=None, ge=0, le=100_000_000)
+    daily_pnl: float | None = Field(default=None, ge=-100_000_000, le=100_000_000)
+    liquidity: float | None = Field(default=None, ge=0, le=10_000_000_000)
+    event_risk: bool | None = None
     confirmed: bool = False
     intent: TradeIntent | None = None
 

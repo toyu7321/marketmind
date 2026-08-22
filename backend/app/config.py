@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from functools import lru_cache
 
 from pydantic import AliasChoices, Field, field_validator, model_validator
@@ -13,8 +14,10 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_model: str = "gpt-5-mini"
     enable_openai_analysis: bool = False
-    alpaca_api_key: str = ""
-    alpaca_secret_key: str = ""
+    # Market-data-only credentials. Do not reuse an account/order-capable
+    # broker credential here; executor credentials are a separate runtime.
+    alpaca_market_data_api_key: str = Field(default="", validation_alias="ALPACA_MARKET_DATA_API_KEY")
+    alpaca_market_data_secret_key: str = Field(default="", validation_alias="ALPACA_MARKET_DATA_SECRET_KEY")
     alpaca_base_url: str = "https://paper-api.alpaca.markets"
     alpaca_data_url: str = "https://data.alpaca.markets"
     alpaca_feed: str = "iex"
@@ -45,11 +48,19 @@ class Settings(BaseSettings):
     admin_mfa_required: bool = True
     audit_ip_hmac_secret: str = ""
     rate_limit_per_minute: int = 120
+    # Optional shared limiter for multi-instance API deployments. The local
+    # fallback exists only for single-instance research UI; execution remains
+    # disabled unless this is configured and healthy.
+    redis_url: str = ""
+    rate_limit_require_shared_for_execution: bool = True
+    max_request_body_bytes: int = 1_000_000
+    executor_intent_signing_key: str = ""
     # A deliberately short-lived remote-first-admin escape hatch. It never
     # enables itself and must be removed from the host after one successful use.
     bootstrap_admin_enabled: bool = False
     bootstrap_admin_secret: str = ""
     bootstrap_admin_rate_limit_per_hour: int = 3
+    bootstrap_admin_expires_at: datetime | None = None
     auto_create_schema: bool | None = None
 
     model_config = SettingsConfigDict(env_file="../.env", extra="ignore")
@@ -89,6 +100,8 @@ class Settings(BaseSettings):
     def validate_production_security(self):
         if self.auth_mode.lower() != "required":
             raise ValueError("AUTH_MODE must be required; anonymous authentication modes are not supported.")
+        if self.enable_remote_paper_orders:
+            raise ValueError("ENABLE_REMOTE_PAPER_ORDERS must remain false pending a fresh independent execution review.")
         if self.is_production:
             origins = self.cors_origin_list
             if not origins or "*" in origins:
@@ -105,8 +118,12 @@ class Settings(BaseSettings):
                 raise ValueError("Production requires AUDIT_IP_HMAC_SECRET for privacy-preserving audit metadata.")
         if self.bootstrap_admin_enabled and len(self.bootstrap_admin_secret) < 32:
             raise ValueError("BOOTSTRAP_ADMIN_ENABLED requires a BOOTSTRAP_ADMIN_SECRET of at least 32 characters.")
+        if self.is_production and self.bootstrap_admin_enabled and self.bootstrap_admin_expires_at is None:
+            raise ValueError("Production bootstrap requires BOOTSTRAP_ADMIN_EXPIRES_AT.")
         if self.bootstrap_admin_rate_limit_per_hour < 1 or self.bootstrap_admin_rate_limit_per_hour > 10:
             raise ValueError("BOOTSTRAP_ADMIN_RATE_LIMIT_PER_HOUR must be between 1 and 10.")
+        if not 16_384 <= self.max_request_body_bytes <= 10_000_000:
+            raise ValueError("MAX_REQUEST_BODY_BYTES must be between 16384 and 10000000.")
         return self
 
     @field_validator("alpaca_feed")
@@ -141,7 +158,7 @@ class Settings(BaseSettings):
 
     @property
     def demo_mode(self) -> bool:
-        return not bool(self.alpaca_api_key and self.alpaca_secret_key)
+        return not bool(self.alpaca_market_data_api_key and self.alpaca_market_data_secret_key)
 
     @property
     def openai_enabled(self) -> bool:

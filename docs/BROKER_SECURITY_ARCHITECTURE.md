@@ -1,5 +1,33 @@
 # Broker execution security architecture
 
+## Implemented boundary (non-operational)
+
+The FastAPI application no longer contains a broker order provider/client. The
+separately deployable `backend/services/executor/` package is not imported by
+the API, AI, or strategy code and currently raises `ExecutionDisabled`; it has
+no broker SDK or broker order endpoint. The API can persist a canonical,
+immutable intent plus durable outbox row only.
+
+The API deployment holds market-data-only credentials
+(`ALPACA_MARKET_DATA_API_KEY` / `ALPACA_MARKET_DATA_SECRET_KEY`) and an optional
+intent-signing key. It must not receive `EXECUTOR_BROKER_API_KEY` or
+`EXECUTOR_BROKER_SECRET_KEY`. Those future broker credentials belong only in a
+private executor deployment. Browser/Vercel receives neither. Existing
+`ALPACA_API_KEY`/`ALPACA_SECRET_KEY` deployment variables must be replaced by
+the market-data-only pair before this remediation is deployed.
+
+Signed envelopes contain an immutable ID, canonical payload digest, expiry,
+and nonce. The executor must verify the signature and revalidate canonical
+account/market/instrument/risk/hold state before a future dispatch. A signature
+is not approval. Outbox transitions use `VALIDATED`, `CLAIMED`, `DISPATCHING`,
+`ACKNOWLEDGED`, `PARTIALLY_FILLED`, `FILLED`, `CANCELLED`, `REJECTED`,
+`UNKNOWN`, and `RECONCILING`; uncertain outcomes must reconcile by deterministic
+`broker_client_order_id`, never submit again blindly.
+
+**Not implemented:** mTLS/private-network transport, broker gateway SDK,
+broker callbacks, broker reconciliation polling, or dispatch. These are
+deliberately blocked pending operational ownership and an independent re-audit.
+
 ## Current state
 
 MarketMind has **no activated broker execution path**. `ENABLE_LIVE_TRADING=false` and `ENABLE_REMOTE_PAPER_ORDERS=false` remain required. The order endpoint is retained only as a locked, audited compatibility boundary; it cannot submit an order to Alpaca.

@@ -1,16 +1,17 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hmac
 from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import get_settings
-from .database import ActiveSession, AuditEvent, BrokerConnection, Invitation, SystemSetting, User, get_db, utcnow
+from .database import ActiveSession, AuditEvent, BootstrapState, BrokerConnection, Invitation, SystemSetting, TradingControlState, TradingHold, User, get_db, utcnow
 from .schemas import BootstrapAdminRequest, GlobalSecurityUpdate, InviteUserRequest, UserAdminUpdate
 from .security import Principal, client_rate_limit_subject, rate_limiter, require_admin, write_audit
 from .risk import RISK_POLICY_VERSION, RiskLimits
@@ -123,19 +124,42 @@ async def bootstrap_first_admin(
     if not provider_email or provider_email != requested_email:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="The supplied identity and email do not match.")
 
-    existing_admin = (await db.execute(select(User).where(User.role == "ADMIN").limit(1))).scalar_one_or_none()
-    if existing_admin is not None:
-        if existing_admin.auth_subject == subject and existing_admin.email.lower() == requested_email:
+    # A durable singleton serializes all first-admin contenders. It is not a
+    # process lock and remains correct across multiple Render workers/processes.
+    state = await db.get(BootstrapState, "first_admin", with_for_update=True)
+    if state is None:
+        try:
+            async with db.begin_nested():
+                state = BootstrapState(key="first_admin", expires_at=settings.bootstrap_admin_expires_at or (utcnow() + timedelta(minutes=15)))
+                db.add(state)
+                await db.flush()
+        except IntegrityError:
+            state = await db.get(BootstrapState, "first_admin", with_for_update=True)
+    if state is None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Bootstrap state could not be locked.")
+    expires_at = state.expires_at.replace(tzinfo=timezone.utc) if state.expires_at and state.expires_at.tzinfo is None else state.expires_at
+    if expires_at and utcnow() >= expires_at and state.completed_user_id is None:
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail="Bootstrap window has expired.")
+    if state.completed_user_id:
+        existing_admin = await db.get(User, state.completed_user_id)
+        if existing_admin and existing_admin.auth_subject == subject and existing_admin.email.lower() == requested_email:
             # Retries from a failed network response are harmless, but never create
             # another account or reopen bootstrap for a different identity.
             await write_audit(db, request, event_type="ADMIN_BOOTSTRAP_REPLAY", user_id=existing_admin.id, resource="admin/bootstrap")
             await db.commit()
             response.status_code = status.HTTP_200_OK
             return {"status": "already_bootstrapped", "user": user_view(existing_admin)}
-        await write_audit(db, request, event_type="ADMIN_BOOTSTRAP_REJECTED", resource="admin/bootstrap", result="DENIED", safe_metadata={"reason": "administrator_already_exists"})
+        await write_audit(db, request, event_type="ADMIN_BOOTSTRAP_REJECTED", resource="admin/bootstrap", result="DENIED", safe_metadata={"reason": "bootstrap_already_completed"})
         await db.commit()
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Bootstrap has already been completed.")
 
+    # Defense-in-depth for old databases that already contain an administrator
+    # but have not yet materialized the singleton state.
+    existing_admin = (await db.execute(select(User).where(User.role == "ADMIN").limit(1).with_for_update())).scalar_one_or_none()
+    if existing_admin is not None:
+        await write_audit(db, request, event_type="ADMIN_BOOTSTRAP_REJECTED", resource="admin/bootstrap", result="DENIED", safe_metadata={"reason": "administrator_already_exists"})
+        await db.commit()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Bootstrap has already been completed.")
     matching_subject = (await db.execute(select(User).where(User.auth_subject == subject))).scalar_one_or_none()
     matching_email = (await db.execute(select(User).where(User.email == requested_email))).scalar_one_or_none()
     if matching_subject and matching_email and matching_subject.id != matching_email.id:
@@ -159,6 +183,7 @@ async def bootstrap_first_admin(
         user.is_active = True
         user.email_verified = bool(provider_user.get("email_confirmed_at"))
     await db.flush()
+    state.completed_user_id, state.completed_at = user.id, utcnow()
     await write_audit(db, request, event_type="ADMIN_BOOTSTRAPPED", user_id=user.id, resource="admin/bootstrap")
     await db.commit()
     return {"status": "bootstrapped", "user": user_view(user)}
@@ -260,6 +285,22 @@ async def update_global_security(payload: GlobalSecurityUpdate, request: Request
         db.add(row)
     else:
         row.value, row.updated_by_user_id = current, principal.user.id
+    if "global_kill_switch" in update:
+        control = await db.get(TradingControlState, "global", with_for_update=True)
+        if control is None:
+            control = TradingControlState(key="global")
+            db.add(control)
+            await db.flush()
+        control.hold_generation += 1
+        control.global_hold_active = bool(update["global_kill_switch"])
+        global_holds = (await db.execute(select(TradingHold).where(
+            TradingHold.scope == "GLOBAL", TradingHold.reason_code == "GLOBAL_KILL_SWITCH", TradingHold.active.is_(True),
+        ))).scalars().all()
+        if control.global_hold_active and not global_holds:
+            db.add(TradingHold(scope="GLOBAL", reason_code="GLOBAL_KILL_SWITCH", hold_generation=control.hold_generation))
+        elif not control.global_hold_active:
+            for hold in global_holds:
+                hold.active, hold.released_at = False, utcnow()
     if update.get("global_kill_switch") is True:
         event = "GLOBAL_KILL_SWITCH_TRIGGERED"
     elif update.get("global_kill_switch") is False:

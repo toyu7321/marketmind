@@ -2,6 +2,22 @@
 
 Assessment date: 2026-08-22. Automated tests and code controls reduce risk; they do not constitute a penetration test, compliance certification, or authorization to enable autonomous trading.
 
+## Remediation status
+
+The current release implements and tests server-authoritative risk context,
+post-trade aggregation, instrument metadata, conservative executable prices,
+strategy ledgers, durable loss/reconciliation holds, replay-safe intent/outbox
+state, local bearer-session revocation checks, bounded bootstrap state, nested
+redaction, and production OpenAPI disablement. Redis-backed rate limiting is
+implemented when `REDIS_URL` is configured; the observable process-local
+fallback is for single-instance read-only/research use only and blocks any
+future remote execution.
+
+This does **not** make autonomous paper or live trading safe. The executor is
+non-operational, no broker credentials are present in the API runtime, and the
+required broker reconciliation/mTLS/operational controls remain deployment and
+re-audit gates.
+
 ## Safe for current authenticated market-data use
 
 Subject to correct host configuration, the current release is suitable for private, read-oriented market intelligence: Supabase JWT/JWKS validation fails closed, per-user ownership is enforced and tested, admins require AAL2, private API/PWA responses are not cached, secrets are backend-only/redacted, and public-market provider failures are labelled rather than silently fabricated.

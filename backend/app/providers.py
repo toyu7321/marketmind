@@ -38,7 +38,7 @@ BASE = {
 
 def _headers() -> dict[str, str]:
     settings = get_settings()
-    return {"APCA-API-KEY-ID": settings.alpaca_api_key, "APCA-API-SECRET-KEY": settings.alpaca_secret_key}
+    return {"APCA-API-KEY-ID": settings.alpaca_market_data_api_key, "APCA-API-SECRET-KEY": settings.alpaca_market_data_secret_key}
 
 
 def _number(value: Any, default: float | None = None) -> float | None:
@@ -199,7 +199,8 @@ async def close_provider_clients() -> None:
 
 async def alpaca_http_client() -> httpx.AsyncClient:
     await start_provider_clients()
-    assert _alpaca_client is not None
+    if _alpaca_client is None:
+        raise RuntimeError("Alpaca HTTP client could not be initialized")
     return _alpaca_client
 
 
@@ -271,7 +272,8 @@ class DemoMarketProvider(MarketDataProvider):
     """Deterministic synthetic data, so a zero-key install is usable and repeatable."""
 
     def _rng(self, symbol: str) -> random.Random:
-        return random.Random(sum(map(ord, symbol.upper())))
+        # Demo fixtures need reproducibility, never cryptographic randomness.
+        return random.Random(sum(map(ord, symbol.upper())))  # nosec B311
 
     async def get_bars(self, symbol: str, days: int = 180) -> list[dict[str, Any]]:
         symbol = symbol.upper()
@@ -340,6 +342,7 @@ class AlpacaMarketProvider(MarketDataProvider):
     def _quote_from_snapshot(self, symbol: str, payload: dict[str, Any]) -> dict[str, Any]:
         settings = get_settings()
         latest = payload.get("latestTrade") or payload.get("latest_trade") or {}
+        latest_quote = payload.get("latestQuote") or payload.get("latest_quote") or {}
         daily = payload.get("dailyBar") or payload.get("daily_bar") or {}
         previous = payload.get("prevDailyBar") or payload.get("previous_daily_bar") or {}
         price = _number(latest.get("p", latest.get("price"))) or _number(daily.get("c", daily.get("close")))
@@ -352,6 +355,11 @@ class AlpacaMarketProvider(MarketDataProvider):
         return {
             "symbol": symbol, "company": _company_name(symbol), "company_metadata_source": "MarketMind symbol catalog",
             "price": price, "change": change, "change_percent": round(change / previous_close * 100, 2),
+            # Bid/ask are included only when the configured market-data feed
+            # provides them. The canonical execution-risk builder fails closed
+            # rather than substituting a browser estimate when either is absent.
+            "bid": _number(latest_quote.get("bp", latest_quote.get("bid_price"))),
+            "ask": _number(latest_quote.get("ap", latest_quote.get("ask_price"))),
             "volume": _number(daily.get("v", daily.get("volume"))), "sparkline": [], "trend": "Up" if change > 0 else "Down" if change < 0 else "Flat", "score": None,
             "freshness": quality, "data_quality": quality, "source": "Alpaca Market Data", "provider": "Alpaca", "feed": settings.alpaca_feed,
             "updated_at": updated_at, "reason": None,
@@ -825,87 +833,9 @@ def strategy_candidates(spot: float, chain: list[dict[str, Any]]) -> list[dict[s
     ]
 
 
-class BrokerProvider(ABC):
-    @abstractmethod
-    async def account(self) -> dict[str, Any]: ...
-    @abstractmethod
-    async def positions(self) -> list[dict[str, Any]]: ...
-    @abstractmethod
-    async def orders(self) -> list[dict[str, Any]]: ...
-    @abstractmethod
-    async def submit_order(self, order: dict[str, Any]) -> dict[str, Any]: ...
-
-
-class DemoPaperBroker(BrokerProvider):
-    async def account(self) -> dict[str, Any]:
-        return {"mode": "PAPER", "source": "DEMO", "equity": 100000, "cash": 42500, "buying_power": 85000}
-    async def positions(self) -> list[dict[str, Any]]:
-        return [
-            {"symbol": "NVDA", "quantity": 35, "average_cost": 151.2, "price": 182.37, "sector": "Semiconductors"},
-            {"symbol": "MSFT", "quantity": 18, "average_cost": 474.1, "price": 522.18, "sector": "Technology"},
-            {"symbol": "SPY", "quantity": 22, "average_cost": 608.4, "price": 643.18, "sector": "Broad Market"},
-        ]
-    async def orders(self) -> list[dict[str, Any]]:
-        return [{"symbol": "AMD", "side": "BUY", "quantity": 10, "status": "Filled", "price": 171.82}, {"symbol": "NVDA", "side": "SELL", "quantity": 5, "status": "Filled", "price": 180.44}]
-    async def submit_order(self, order: dict[str, Any]) -> dict[str, Any]:
-        return {"status": "paper accepted", "source": "DEMO", "order": order}
-
-
-class AlpacaPaperBroker(DemoPaperBroker):
-    async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
-        settings = get_settings()
-        client = await alpaca_http_client()
-        with measure("alpaca.paper"):
-            response = await client.request(method, f"{settings.alpaca_base_url.rstrip('/')}{path}", headers=_headers(), **kwargs)
-        response.raise_for_status()
-        return response.json()
-    async def account(self) -> dict[str, Any]:
-        try:
-            account = await self._request("GET", "/v2/account")
-            return {"mode": "PAPER", "source": "ALPACA PAPER", "equity": _number(account.get("equity"), 0), "cash": _number(account.get("cash"), 0), "buying_power": _number(account.get("buying_power"), 0)}
-        except httpx.HTTPError as error:
-            logger.warning("broker_account_fallback", extra={"reason": type(error).__name__})
-            return await super().account()
-    async def positions(self) -> list[dict[str, Any]]:
-        try:
-            rows = await self._request("GET", "/v2/positions")
-            return [{"symbol": row.get("symbol"), "quantity": _number(row.get("qty"), 0), "average_cost": _number(row.get("avg_entry_price"), 0), "price": _number(row.get("current_price"), 0), "sector": "Unclassified", "market_value": _number(row.get("market_value"), 0), "unrealized_pl": _number(row.get("unrealized_pl"), 0), "daily_pl": _number(row.get("unrealized_intraday_pl"), 0)} for row in rows]
-        except httpx.HTTPError as error:
-            logger.warning("broker_positions_fallback", extra={"reason": type(error).__name__})
-            return await super().positions()
-    async def orders(self) -> list[dict[str, Any]]:
-        try:
-            rows = await self._request("GET", "/v2/orders", params={"status": "all", "limit": 20, "direction": "desc"})
-            return [{"symbol": row.get("symbol"), "side": str(row.get("side", "")).upper(), "quantity": _number(row.get("qty"), 0), "status": row.get("status"), "price": _number(row.get("filled_avg_price") or row.get("limit_price"), 0)} for row in rows]
-        except httpx.HTTPError as error:
-            logger.warning("broker_orders_fallback", extra={"reason": type(error).__name__})
-            return await super().orders()
-    async def submit_order(self, order: dict[str, Any]) -> dict[str, Any]:
-        payload = {"symbol": order["symbol"], "qty": str(order["quantity"]), "side": order["side"].lower(), "type": order["order_type"], "time_in_force": order["time_in_force"].lower()}
-        if order.get("limit_price") is not None:
-            payload["limit_price"] = str(order["limit_price"])
-        try:
-            return {"source": "ALPACA PAPER", "order": await self._request("POST", "/v2/orders", json=payload)}
-        except httpx.HTTPError as error:
-            logger.warning("broker_order_error", extra={"symbol": order["symbol"], "reason": type(error).__name__})
-            raise RuntimeError("Alpaca paper order could not be submitted") from error
-
-
-class LiveBrokerGuard(BrokerProvider):
-    """Live execution is intentionally unavailable in this local-first build."""
-    async def account(self) -> dict[str, Any]: return {"mode": "LIVE", "status": "disabled"}
-    async def positions(self) -> list[dict[str, Any]]: return []
-    async def orders(self) -> list[dict[str, Any]]: return []
-    async def submit_order(self, order: dict[str, Any]) -> dict[str, Any]:
-        raise PermissionError("Live trading is disabled. MarketMind cannot autonomously submit real-money orders.")
-
-
 def market_provider() -> MarketDataProvider:
     return DemoMarketProvider() if get_settings().demo_mode else AlpacaMarketProvider()
 def news_provider() -> NewsProvider:
     return DemoNewsProvider() if get_settings().demo_mode else AlpacaNewsProvider()
 def options_provider() -> OptionsDataProvider:
     return DemoOptionsProvider() if get_settings().demo_mode else AlpacaOptionsProvider()
-def broker_provider() -> BrokerProvider:
-    settings = get_settings()
-    return AlpacaPaperBroker() if settings.enable_paper_trading and not settings.demo_mode else DemoPaperBroker()

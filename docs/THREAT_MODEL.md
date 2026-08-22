@@ -1,6 +1,17 @@
 # MarketMind threat model
 
-This is the security model for the current authenticated market-intelligence service and the planned isolated execution boundary. It is not a claim of certification or an authorization to trade autonomously.
+This is the security model for the current authenticated market-intelligence service and the non-operational isolated execution boundary. It is not a claim of certification or an authorization to trade autonomously.
+
+## Remediation controls
+
+| Threat | Implemented control | Remaining boundary |
+| --- | --- | --- |
+| Browser falsifies an order | Server canonical context; client facts are informational only | Broker source reconciliation is executor work |
+| Incremental/replayed order | Post-trade aggregate ledger, immutable payload hash, lease/claim outbox | Production PostgreSQL soak/concurrency run |
+| Kill-switch race | Durable hold generation rechecked at validation/claim/dispatch contract | No active dispatch process exists |
+| Stolen bearer | Active-session revocation, session cutoff with current-session exemption | Supabase provider-side global session revocation is deployment dependent |
+| Multi-instance abuse | Redis limiter adapter and request-size bounds | Configure/monitor Redis before any execution tier |
+| First-admin race | Singleton bootstrap state with DB locking and expiry | Run migration before enabling bootstrap |
 
 ## Assets and trust boundaries
 

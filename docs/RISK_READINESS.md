@@ -1,4 +1,30 @@
-# Risk readiness: security freeze v1
+# Risk readiness: authoritative remediation v2
+
+## Current status
+
+**Implemented and tested:** the only order-risk path builds an immutable
+`CanonicalRiskContext` on the server. Browser/AI payload values for price,
+asset type, equity, buying power, exposures, P&L, liquidity, spread, provider
+health, and market status are ignored. It resolves server-side instrument
+metadata, uses bid/ask-conservative pricing, includes option multipliers and
+underlying concentration, aggregates existing positions plus durable open
+outbox records, and applies post-trade symbol/underlying/sector/theme/gross and
+strategy caps. Unknown metadata, stale/degraded data, unregistered strategies,
+unknown broker reconciliation, and any missing canonical fact are **NO TRADE**.
+
+Loss/drawdown triggers create durable `trading_holds` with a monotonically
+increasing control generation. Validation, executor claim, and the future
+dispatch boundary must all compare that generation; a queued intent cannot
+survive a new kill switch or reconciliation hold.
+
+**Deployment-dependent:** live canonical broker balances, positions, fills,
+and buying power must be supplied by the separately deployed executor's
+reconciliation integration. The current application ledger is the trusted
+source for this preview-only release.
+
+**Planned / blocked:** no paper or live broker submission, automated recovery,
+or autonomous trading is authorized. Keep `ENABLE_REMOTE_PAPER_ORDERS=false`
+and `ENABLE_LIVE_TRADING=false` until a fresh independent adversarial re-audit.
 
 The risk engine is deterministic, has no broker dependency, and is the final authority over a structured signal. It does not enable paper or live execution.
 

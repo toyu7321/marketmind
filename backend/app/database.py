@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -36,6 +36,9 @@ class User(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     sessions_revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # For an "all other sessions" action, tokens issued before this boundary
+    # are rejected unless they belong to this explicitly retained session.
+    sessions_revocation_exempt_session_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     kill_switch_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
@@ -186,6 +189,7 @@ class TradeIntentRecord(Base):
     """
 
     __tablename__ = "trade_intents"
+    __table_args__ = (Index("uq_trade_intent_user_payload_hash", "user_id", "payload_hash", unique=True),)
 
     intent_id: Mapped[str] = mapped_column(String(36), primary_key=True)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
@@ -194,8 +198,139 @@ class TradeIntentRecord(Base):
     broker_client_order_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     status: Mapped[str] = mapped_column(String(32), default="VALIDATED", index=True)
+    # The generation is captured at validation. An executor must compare it to
+    # the durable control state again when claiming and dispatching work.
+    hold_generation: Mapped[int] = mapped_column(Integer, default=0)
+    state_version: Mapped[int] = mapped_column(Integer, default=1)
+    nonce: Mapped[str] = mapped_column(String(96), default=uuid_value, unique=True, index=True)
+    lease_owner: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class InstrumentMetadata(Base):
+    """Server-verified instrument facts used only by canonical risk controls."""
+
+    __tablename__ = "instrument_metadata"
+
+    symbol: Mapped[str] = mapped_column(String(64), primary_key=True)
+    asset_type: Mapped[str] = mapped_column(String(24), index=True)
+    underlying_symbol: Mapped[str | None] = mapped_column(String(24), nullable=True, index=True)
+    sector: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
+    theme: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
+    leverage: Mapped[float] = mapped_column(Float, default=1.0)
+    contract_multiplier: Mapped[float] = mapped_column(Float, default=1.0)
+    option_strike: Mapped[float | None] = mapped_column(Float, nullable=True)
+    option_expiry: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    option_right: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    source: Mapped[str] = mapped_column(String(48), default="CURATED")
+    verified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+class PortfolioRiskLedger(Base):
+    """Server-written account and loss state; client payloads never populate it."""
+
+    __tablename__ = "portfolio_risk_ledger"
+
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    equity: Mapped[float] = mapped_column(Float, default=0.0)
+    peak_equity: Mapped[float] = mapped_column(Float, default=0.0)
+    daily_pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    weekly_pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    calculated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class StrategyRiskLedger(Base):
+    """Registered strategy allocation and loss state, keyed to its owner."""
+
+    __tablename__ = "strategy_risk_ledger"
+    __table_args__ = (UniqueConstraint("user_id", "strategy_id", name="uq_strategy_risk_user_strategy"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_value)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    strategy_id: Mapped[str] = mapped_column(String(80), index=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    allocation_value: Mapped[float] = mapped_column(Float, default=0.0)
+    daily_pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    peak_value: Mapped[float] = mapped_column(Float, default=0.0)
+    current_value: Mapped[float] = mapped_column(Float, default=0.0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class TradingControlState(Base):
+    """One durable singleton whose generation invalidates stale intent approval."""
+
+    __tablename__ = "trading_control_state"
+
+    key: Mapped[str] = mapped_column(String(32), primary_key=True, default="global")
+    hold_generation: Mapped[int] = mapped_column(Integer, default=0)
+    global_hold_active: Mapped[bool] = mapped_column(Boolean, default=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class TradingHold(Base):
+    """Durable, auditable circuit breaker; a release needs controlled action."""
+
+    __tablename__ = "trading_holds"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_value)
+    scope: Mapped[str] = mapped_column(String(16), index=True)  # GLOBAL, USER, STRATEGY, RECONCILIATION
+    user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
+    strategy_id: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
+    reason_code: Mapped[str] = mapped_column(String(96), index=True)
+    hold_generation: Mapped[int] = mapped_column(Integer, index=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ExecutionOutbox(Base):
+    """Committed dispatch record. Workers claim it instead of blindly resubmitting."""
+
+    __tablename__ = "execution_outbox"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_value)
+    intent_id: Mapped[str] = mapped_column(ForeignKey("trade_intents.intent_id", ondelete="CASCADE"), unique=True, index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    broker_client_order_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    payload_hash: Mapped[str] = mapped_column(String(128), index=True)
+    state: Mapped[str] = mapped_column(String(32), default="VALIDATED", index=True)
+    hold_generation: Mapped[int] = mapped_column(Integer, default=0)
+    lease_owner: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    dispatch_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    broker_status: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class BrokerReconciliationState(Base):
+    """Mismatch/unknown broker state creates an executor-visible trading hold."""
+
+    __tablename__ = "broker_reconciliation_state"
+    __table_args__ = (UniqueConstraint("user_id", "broker_connection_id", name="uq_broker_reconciliation_connection"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_value)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    broker_connection_id: Mapped[str | None] = mapped_column(ForeignKey("broker_connections.id", ondelete="SET NULL"), nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String(32), default="UNVERIFIED", index=True)
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    mismatch_reason: Mapped[str | None] = mapped_column(String(180), nullable=True)
+
+
+class BootstrapState(Base):
+    """A singleton row locks one-time remote first-admin bootstrap globally."""
+
+    __tablename__ = "bootstrap_state"
+
+    key: Mapped[str] = mapped_column(String(32), primary_key=True, default="first_admin")
+    completed_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, unique=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Invitation(Base):

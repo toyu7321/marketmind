@@ -70,8 +70,8 @@ ENABLE_LIVE_TRADING=false
 
 OPENAI_API_KEY=
 ENABLE_OPENAI_ANALYSIS=false
-ALPACA_API_KEY=
-ALPACA_SECRET_KEY=
+ALPACA_MARKET_DATA_API_KEY=
+ALPACA_MARKET_DATA_SECRET_KEY=
 ALPACA_DATA_URL=https://data.alpaca.markets
 ALPACA_FEED=iex
 ALPACA_OPTIONS_FEED=indicative
@@ -83,7 +83,7 @@ ALPACA_OAUTH_REDIRECT_URI=
 SEC_USER_AGENT=MarketMind security@example.com
 ```
 
-Use the host’s encrypted environment-variable facility. Never put the secret key, audit HMAC secret, database URL, broker credentials, OAuth client secret, or token-store credentials in Vercel, Git, browser storage, `NEXT_PUBLIC_*`, or logs. The container runs Alembic during startup; a managed release command that runs `alembic upgrade head` before deployment is preferred for controlled production changes.
+Use the host’s encrypted environment-variable facility. Never put the secret key, audit HMAC secret, database URL, broker credentials, OAuth client secret, or token-store credentials in Vercel, Git, browser storage, `NEXT_PUBLIC_*`, or logs. Use only market-data-scoped Alpaca credentials in the API service. Future `EXECUTOR_BROKER_*` credentials belong exclusively to a separately deployed private executor and must not be configured for this release. The container runs Alembic during startup; a managed release command that runs `alembic upgrade head` before deployment is preferred for controlled production changes.
 
 At this stage, visit `https://YOUR_API/api/health`. It should return `healthy`, `authentication: configured`, and `live_trading: locked`, without secret values. The market-specific fields are intentionally safe: `market_provider`, `market_feed`, `market_data_status`, `news_provider`, and `options_provider`. The first successful public request changes a configured Alpaca connection to `Healthy`; a feed failure becomes `Degraded` and never produces synthetic live-looking values.
 
@@ -94,7 +94,7 @@ For Live Market Data V1, keep `ALPACA_DATA_URL=https://data.alpaca.markets` and 
 This temporary procedure is for Render Free and other hosts where an operator shell is unavailable. It does **not** create a permanent public administrator endpoint.
 
 1. In Render, set `BOOTSTRAP_ADMIN_ENABLED=true`.
-2. Generate a high-entropy, unique secret of at least 32 characters in a password manager. Set it as `BOOTSTRAP_ADMIN_SECRET` in Render. Do not put it in Git, Vercel, a `NEXT_PUBLIC_*` value, or the request body.
+2. Generate a high-entropy, unique secret of at least 32 characters in a password manager. Set it as `BOOTSTRAP_ADMIN_SECRET` in Render, and set `BOOTSTRAP_ADMIN_EXPIRES_AT` to a near UTC ISO-8601 expiry (for example `2026-08-22T14:00:00Z`). Do not put either in Git, Vercel, a `NEXT_PUBLIC_*` value, or the request body.
 3. Keep `ENABLE_LIVE_TRADING=false` and `ENABLE_REMOTE_PAPER_ORDERS=false`, then redeploy the backend.
 4. After the deployment is healthy, call the backend URL exactly once. Store the secret in a shell variable so it is sent only in the dedicated header:
 

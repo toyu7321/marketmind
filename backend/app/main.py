@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import hmac
 import json
 import math
 import time
@@ -21,8 +20,8 @@ from .admin import router as admin_router
 from .backtesting import run_backtest
 from .config import get_settings
 from .database import (
-    BacktestRun, BrokerConnection, PaperOrder, Portfolio, PortfolioPosition, Prediction, SavedStrategy, TradeIntentRecord,
-    SystemSetting, UserPreference, UserRiskProfile, UserSetting, get_db, init_db, utcnow,
+    BacktestRun, PaperOrder, Portfolio, PortfolioPosition, Prediction, SavedStrategy,
+    SystemSetting, TradingControlState, TradingHold, UserPreference, UserRiskProfile, UserSetting, get_db, init_db, utcnow,
 )
 from .indicators import technical_snapshot
 from .observability import begin_request, cache_event, finish_request, latency_report, log_request, measure, reset_request, response_headers, safe_endpoint_name
@@ -30,12 +29,15 @@ from .providers import (
     EdgarSECProvider, analyze_evidence, close_provider_clients, market_provider, news_provider,
     options_provider, public_market_cache_report, start_provider_clients, strategy_candidates,
 )
+from .canonical_risk import build_canonical_risk_context, canonical_decision, persist_circuit_breakers
+from .execution_protocol import payload_hash
+from .execution_state import IntentConflict, create_order_receipt, create_validated_intent
 from .risk import RISK_POLICY_VERSION, RiskLimits, evaluate
 from .redaction import install_secret_redaction
 from .schemas import BacktestRequest, PaperOrderRequest, PortfolioResponse, PredictionCreate, RiskRequest, SettingsUpdate
 from .scoring import MARKET_WEIGHTS, STOCK_WEIGHTS, score
 from .security import (
-    Principal, get_owned_resource, rate_limit, require_authenticated_user,
+    Principal, get_owned_resource, rate_limit, rate_limiter, require_authenticated_user,
     require_sensitive_action_auth, trading_allowed, write_audit,
 )
 
@@ -61,14 +63,16 @@ class TimedJSONResponse(JSONResponse):
 
 app = FastAPI(
     title="MarketMind API", version="2.0.0", lifespan=lifespan,
-    docs_url=None if get_settings().is_production else "/docs", default_response_class=TimedJSONResponse,
+    docs_url=None if get_settings().is_production else "/docs",
+    openapi_url=None if get_settings().is_production else "/openapi.json",
+    default_response_class=TimedJSONResponse,
 )
 settings = get_settings()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "Idempotency-Key", "X-Request-ID"],
+    allow_headers=["Content-Type", "Authorization", "Idempotency-Key", "X-Request-ID", "X-Bootstrap-Secret"],
     allow_credentials=False,
 )
 
@@ -78,6 +82,10 @@ async def security_headers(request: Request, call_next):
     token = begin_request()
     response: Response | None = None
     try:
+        length = request.headers.get("content-length")
+        if request.url.path.startswith("/api/") and length and int(length) > settings.max_request_body_bytes:
+            response = JSONResponse(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, content={"detail": "Request body is too large."})
+            return response
         response = await call_next(request)
         endpoint = safe_endpoint_name(request.url.path)
         profile, total_ms = finish_request(endpoint)
@@ -86,7 +94,10 @@ async def security_headers(request: Request, call_next):
         log_request(endpoint, profile, total_ms)
     finally:
         reset_request(token)
-    assert response is not None
+    if response is None:
+        # ``call_next`` either returns a response or raises; preserve a safe
+        # failure mode without relying on an optimisation-removable assert.
+        raise RuntimeError("response middleware completed without a response")
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
@@ -310,12 +321,12 @@ async def health(response: Response, db: AsyncSession = Depends(get_db)):
         **news_status,
         **options_status,
         "live_trading": "locked",
-        "performance": {"latency": latency_report(), "public_market_cache": public_market_cache_report()},
+        "performance": {"latency": latency_report(), "public_market_cache": public_market_cache_report(), "rate_limiter": rate_limiter.status()},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
-@app.get("/api/dashboard")
+@app.get("/api/dashboard", dependencies=[Depends(rate_limit("dashboard", 60))])
 async def dashboard(principal: Principal = Depends(require_authenticated_user), db: AsyncSession = Depends(get_db)):
     config, provider = await runtime_settings(db, principal.user.id), market_provider()
     index_symbols = ["SPY", "QQQ", "DIA", "IWM", "VIX"]
@@ -370,7 +381,7 @@ async def dashboard(principal: Principal = Depends(require_authenticated_user), 
     }
 
 
-@app.get("/api/scanner")
+@app.get("/api/scanner", dependencies=[Depends(rate_limit("scanner", 20))])
 async def scanner(principal: Principal = Depends(require_authenticated_user), db: AsyncSession = Depends(get_db)):
     config, provider = await runtime_settings(db, principal.user.id), market_provider()
     symbols = list(dict.fromkeys(config["watchlist"][2:] + ["JPM", "XOM", "LLY", "AVGO", "NFLX", "COST"]))
@@ -390,7 +401,7 @@ async def scanner(principal: Principal = Depends(require_authenticated_user), db
     return {"mode": _mode(output), "provider_status": provider_status, "results": sorted(output, key=lambda row: (row["score"] is None, -(row["score"] or 0)))}
 
 
-@app.get("/api/stocks/{symbol}")
+@app.get("/api/stocks/{symbol}", dependencies=[Depends(rate_limit("stock_intel", 30))])
 async def stock(symbol: str, range_name: str = Query(default="3M", alias="range", pattern="^(1D|5D|1M|3M|6M|1Y)$"), principal: Principal = Depends(require_authenticated_user), db: AsyncSession = Depends(get_db)):
     symbol = symbol.upper()
     if not symbol.isalnum() or len(symbol) > 8:
@@ -420,7 +431,7 @@ async def stock(symbol: str, range_name: str = Query(default="3M", alias="range"
     }
 
 
-@app.get("/api/news")
+@app.get("/api/news", dependencies=[Depends(rate_limit("news", 30))])
 async def news(principal: Principal = Depends(require_authenticated_user), db: AsyncSession = Depends(get_db)):
     config = await runtime_settings(db, principal.user.id)
     provider = news_provider()
@@ -428,7 +439,7 @@ async def news(principal: Principal = Depends(require_authenticated_user), db: A
     return {"mode": mode, "provider_status": provider_status, "items": items, "message": "Alpaca News did not return a feed for this account or request." if mode == "UNAVAILABLE" else None}
 
 
-@app.get("/api/options/{symbol}")
+@app.get("/api/options/{symbol}", dependencies=[Depends(rate_limit("options", 15))])
 async def options(symbol: str, _: Principal = Depends(require_authenticated_user)):
     symbol = symbol.upper()
     if not symbol.isalnum() or len(symbol) > 8:
@@ -457,7 +468,16 @@ async def options(symbol: str, _: Principal = Depends(require_authenticated_user
 @app.post("/api/risk/evaluate", dependencies=[Depends(rate_limit("risk", 30))])
 async def risk_evaluate(req: RiskRequest, principal: Principal = Depends(require_authenticated_user), db: AsyncSession = Depends(get_db)):
     config = await runtime_settings(db, principal.user.id)
-    return evaluate(req, await effective_risk_limits(db, principal, config))
+    simulation = evaluate(req, await effective_risk_limits(db, principal, config))
+    # This legacy endpoint has no connection to execution. Its payload contains
+    # browser-supplied facts and is intentionally unable to authorize anything.
+    return {
+        **simulation,
+        "decision": "NO_TRADE",
+        "authoritative": False,
+        "informational_only": True,
+        "reasons": ["Client-provided risk simulations cannot authorize an order; use the canonical server preview.", *simulation["reasons"]],
+    }
 
 
 @app.post("/api/backtest", dependencies=[Depends(rate_limit("backtest", 12))])
@@ -532,7 +552,7 @@ def _portfolio_number(value: Any, fallback: float = 0.0) -> float:
     return number if math.isfinite(number) else fallback
 
 
-@app.get("/api/portfolio", response_model=PortfolioResponse)
+@app.get("/api/portfolio", response_model=PortfolioResponse, dependencies=[Depends(rate_limit("portfolio", 30))])
 async def portfolio(principal: Principal = Depends(require_authenticated_user), db: AsyncSession = Depends(get_db)):
     account = await _personal_portfolio(db, principal.user.id)
     with measure("database.portfolio_positions"):
@@ -589,22 +609,51 @@ async def paper_order_detail(order_id: str, principal: Principal = Depends(requi
     return {"id": row.id, "status": row.status, "created_at": row.created_at.isoformat()}
 
 
-def _order_risk_request(order: PaperOrderRequest, equity: float) -> RiskRequest:
-    intent = order.intent
-    return RiskRequest(
-        symbol=order.symbol.upper(), proposed_value=order.quantity * (order.limit_price or order.estimated_price), portfolio_equity=equity,
-        current_exposure=order.current_exposure, sector_exposure=order.sector_exposure, daily_pnl=order.daily_pnl,
-        liquidity=order.liquidity, event_risk=order.event_risk, asset_type=intent.asset_type if intent else "STOCK",
-        side=order.side, strategy_id=intent.strategy_id if intent else "manual-preview", confidence=intent.confidence if intent else .5,
+async def _canonical_order_context(order: PaperOrderRequest, db: AsyncSession, principal: Principal):
+    """Construct risk facts from server sources only; UI legacy fields are ignored."""
+    if order.intent is None:
+        return None
+    return await build_canonical_risk_context(
+        db, market_provider(), user=principal.user, symbol=order.symbol, quantity=order.quantity,
+        side=order.side, order_type=order.order_type, limit_price=order.limit_price,
+        strategy_id=order.intent.strategy_id,
     )
+
+
+def _canonical_intent_payload(context: Any, order: PaperOrderRequest) -> dict[str, Any]:
+    """The durable outbox contains server facts, never raw browser risk facts."""
+    if order.intent is None:
+        raise ValueError("canonical intent payload requires a structured intent")
+    return {
+        "intent_id": str(order.intent.intent_id), "symbol": context.symbol, "side": context.side,
+        "quantity": context.quantity, "order_type": context.order_type, "limit_price": order.limit_price,
+        "notional": round(context.order_notional, 8), "conservative_price": round(context.conservative_price, 8),
+        "asset_type": context.instrument.asset_type, "underlying_symbol": context.instrument.underlying_symbol,
+        "sector": context.instrument.sector, "theme": context.instrument.theme,
+        "contract_multiplier": context.instrument.contract_multiplier, "strategy_id": context.strategy_id,
+        "hold_generation": context.hold_generation, "market_data_timestamp": context.market_data_timestamp,
+        "expires_at": order.intent.expires_at.isoformat(), "signal": {
+            "confidence": order.intent.confidence, "expected_horizon": order.intent.expected_horizon,
+            "reason_codes": order.intent.reason_codes,
+        },
+    }
 
 
 @app.post("/api/trading/preview", dependencies=[Depends(rate_limit("order_preview", 10))])
 async def preview_paper_order(order: PaperOrderRequest, principal: Principal = Depends(require_authenticated_user), db: AsyncSession = Depends(get_db)):
     config = await runtime_settings(db, principal.user.id)
-    portfolio_row = await _personal_portfolio(db, principal.user.id)
-    decision = evaluate(_order_risk_request(order, portfolio_row.cash), await effective_risk_limits(db, principal, config))
-    return {"mode": "PAPER", "order": order.model_dump(exclude={"confirmed"}), "risk": decision, "requires_confirmation": False, "execution": "disabled by the security freeze; no broker order can be created", "risk_policy_version": RISK_POLICY_VERSION}
+    context = await _canonical_order_context(order, db, principal)
+    decision = canonical_decision(context, await effective_risk_limits(db, principal, config))
+    holds = await persist_circuit_breakers(db, context, decision) if context is not None else []
+    if holds:
+        await db.commit()
+    ticket = {key: value for key, value in order.model_dump(exclude={"confirmed", "estimated_price", "current_exposure", "sector_exposure", "daily_pnl", "liquidity", "event_risk"}).items() if key != "intent"}
+    return {
+        "mode": "PAPER", "order": ticket, "risk": decision, "requires_confirmation": False,
+        "execution": "disabled by the security freeze; no broker order can be created",
+        "risk_policy_version": RISK_POLICY_VERSION, "client_risk_fields_ignored": True,
+        "durable_holds_created": holds,
+    }
 
 
 @app.post("/api/trading/orders", dependencies=[Depends(rate_limit("order_submit", 5))])
@@ -616,41 +665,38 @@ async def submit_paper_order(order: PaperOrderRequest, request: Request, idempot
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="A current, structured trade intent is required for order submission.")
     if order.intent.symbol.upper() != order.symbol.upper() or order.intent.side != order.side:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Trade intent does not match the proposed order.")
-    payload = order.model_dump(mode="json")
-    preview_hash = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    existing = (await db.execute(select(PaperOrder).where(PaperOrder.user_id == principal.user.id, PaperOrder.idempotency_key == idempotency_key))).scalar_one_or_none()
-    if existing:
-        if not hmac.compare_digest(existing.preview_hash, preview_hash):
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Idempotency key was already used for a different order.")
-        return {"id": existing.id, "status": existing.status, "idempotent_replay": True}
-    existing_intent = await db.get(TradeIntentRecord, str(order.intent.intent_id))
-    if existing_intent is not None:
-        await write_audit(db, request, event_type="TRADE_INTENT_REPLAY_REJECTED", user_id=principal.user.id, resource="trading/orders", result="DENIED", safe_metadata={"intent_id": str(order.intent.intent_id)})
-        await db.commit()
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Trade intent was already consumed or rejected.")
+    context = await _canonical_order_context(order, db, principal)
     config = await runtime_settings(db, principal.user.id)
-    portfolio_row = await _personal_portfolio(db, principal.user.id)
-    decision = evaluate(_order_risk_request(order, portfolio_row.cash), await effective_risk_limits(db, principal, config))
-    client_order_id = f"mm-{str(order.intent.intent_id).replace('-', '')[:24]}"
-    intent_record = TradeIntentRecord(intent_id=str(order.intent.intent_id), user_id=principal.user.id, strategy_id=order.intent.strategy_id, payload_hash=preview_hash, broker_client_order_id=client_order_id, expires_at=order.intent.expires_at, status="REJECTED" if decision["decision"] == "REJECTED" else "VALIDATED")
-    db.add(intent_record)
-    if decision["decision"] == "REJECTED":
+    decision = canonical_decision(context, await effective_risk_limits(db, principal, config))
+    if context is not None:
+        await persist_circuit_breakers(db, context, decision)
+    if decision["decision"] != "APPROVED" or context is None:
         await write_audit(db, request, event_type="TRADE_INTENT_REJECTED", user_id=principal.user.id, resource="trading/orders", result="DENIED", safe_metadata={"intent_id": str(order.intent.intent_id), "policy_version": decision["policy_version"], "reason_count": len(decision["reasons"])})
         await db.commit()
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="The deterministic risk policy rejected this trade intent.")
-    connection = (await db.execute(select(BrokerConnection).where(BrokerConnection.user_id == principal.user.id, BrokerConnection.provider == "alpaca", BrokerConnection.environment == "paper", BrokerConnection.status == "ACTIVE"))).scalar_one_or_none()
-    if connection is None:
-        row = PaperOrder(user_id=principal.user.id, idempotency_key=idempotency_key, payload=payload, preview_hash=preview_hash, status="REJECTED")
-        db.add(row)
-        await write_audit(db, request, event_type="PAPER_ORDER_REJECTED", user_id=principal.user.id, resource="trading/orders", result="DENIED", safe_metadata={"reason": "no_active_user_broker_connection"})
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="The canonical server-side risk policy rejected this trade intent.")
+    payload = _canonical_intent_payload(context, order)
+    preview_hash = payload_hash({key: value for key, value in payload.items() if key != "intent_id"})
+    try:
+        intent_record, outbox, replayed = await create_validated_intent(
+            db, user_id=principal.user.id, intent_id=str(order.intent.intent_id), strategy_id=order.intent.strategy_id,
+            expires_at=order.intent.expires_at, canonical_payload=payload,
+        )
+    except IntentConflict as error:
+        await write_audit(db, request, event_type="TRADE_INTENT_REPLAY_REJECTED", user_id=principal.user.id, resource="trading/orders", result="DENIED", safe_metadata={"intent_id": str(order.intent.intent_id)})
         await db.commit()
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No active user-owned paper broker connection is available.")
-    # OAuth token exchange and execution are intentionally not activated in this security foundation.
-    row = PaperOrder(user_id=principal.user.id, broker_connection_id=connection.id, idempotency_key=idempotency_key, payload=payload, preview_hash=preview_hash, status="REJECTED")
-    db.add(row)
-    await write_audit(db, request, event_type="PAPER_ORDER_REJECTED", user_id=principal.user.id, resource="trading/orders", result="DENIED", safe_metadata={"reason": "oauth_execution_not_activated"})
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Immutable trade intent conflict.") from error
+    try:
+        row, receipt_replayed = await create_order_receipt(
+            db, user_id=principal.user.id, idempotency_key=idempotency_key, preview_hash=preview_hash,
+            intent_id=intent_record.intent_id, outbox_id=outbox.id,
+        )
+    except IntentConflict as error:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Idempotency key was already used for different canonical data.") from error
+    await write_audit(db, request, event_type="TRADE_INTENT_VALIDATED", user_id=principal.user.id, resource="trading/orders", safe_metadata={"intent_id": intent_record.intent_id, "outbox_id": outbox.id, "replayed": replayed or receipt_replayed})
     await db.commit()
-    raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Broker order execution is not activated. MarketMind is operating in secure preview-only mode.")
+    # A separately deployed executor is deliberately unavailable. This API can
+    # validate/enqueue a durable intent but cannot call a broker endpoint.
+    raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Execution is disabled pending independent re-audit; no broker order was submitted.")
 
 
 @app.get("/api/settings")
@@ -696,6 +742,21 @@ async def update_settings(payload: SettingsUpdate, request: Request, principal: 
             db.add(UserRiskProfile(user_id=principal.user.id, limits=profile_limits))
     if "risk" in update and "kill_switch" in update["risk"]:
         principal.user.kill_switch_enabled = bool(update["risk"]["kill_switch"])
+        control = await db.get(TradingControlState, "global", with_for_update=True)
+        if control is None:
+            control = TradingControlState(key="global")
+            db.add(control)
+            await db.flush()
+        control.hold_generation += 1
+        holds = (await db.execute(select(TradingHold).where(
+            TradingHold.active.is_(True), TradingHold.scope == "USER", TradingHold.user_id == principal.user.id,
+            TradingHold.reason_code == "USER_KILL_SWITCH",
+        ))).scalars().all()
+        if principal.user.kill_switch_enabled and not holds:
+            db.add(TradingHold(scope="USER", user_id=principal.user.id, reason_code="USER_KILL_SWITCH", hold_generation=control.hold_generation))
+        elif not principal.user.kill_switch_enabled:
+            for hold in holds:
+                hold.active, hold.released_at = False, utcnow()
         await write_audit(db, request, event_type="KILL_SWITCH_TRIGGERED" if principal.user.kill_switch_enabled else "KILL_SWITCH_RELEASED", user_id=principal.user.id, resource="settings/risk")
     await write_audit(db, request, event_type="RISK_SETTING_CHANGED" if "risk" in update else "SETTINGS_CHANGED", user_id=principal.user.id, resource="settings", safe_metadata={"sections": sorted(update), "risk_keys": sorted(update.get("risk", {})), "risk_policy_version": RISK_POLICY_VERSION})
     await db.commit()

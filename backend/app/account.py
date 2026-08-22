@@ -48,8 +48,11 @@ async def revoke_sessions(payload: SessionRevokeRequest, request: Request, princ
             row.revoked_at = now
             changed += 1
     if payload.all_other_sessions:
-        # Rejecting all tokens issued before this instant also covers sessions not yet observed locally.
+        # Tokens issued before this instant are rejected unless they carry this
+        # explicitly retained session ID. This covers an older, not-yet-seen
+        # bearer without logging out the caller's intended current session.
         principal.user.sessions_revoked_at = now
+        principal.user.sessions_revocation_exempt_session_id = principal.session_id or None
     await write_audit(db, request, event_type="SESSION_REVOKED", user_id=principal.user.id, resource="account/sessions", safe_metadata={"count": changed, "all_other": payload.all_other_sessions})
     await db.commit()
     return {"status": "revoked", "count": changed}

@@ -103,8 +103,8 @@ async def test_scanner_bars_are_requested_in_one_batched_call(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_provider_status_never_leaks_credentials(monkeypatch):
-    monkeypatch.setenv("ALPACA_API_KEY", "should-never-appear")
-    monkeypatch.setenv("ALPACA_SECRET_KEY", "also-never-appear")
+    monkeypatch.setenv("ALPACA_MARKET_DATA_API_KEY", "should-never-appear")
+    monkeypatch.setenv("ALPACA_MARKET_DATA_SECRET_KEY", "also-never-appear")
     get_settings.cache_clear()
     try:
         payload = await AlpacaMarketProvider().provider_status()
