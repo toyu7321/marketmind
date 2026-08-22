@@ -19,8 +19,8 @@ importers:
         specifier: 2.112.3
         version: 2.112.3
       lucide-react:
-        specifier: 0.539.0
-        version: 0.539.0(react@19.1.8)
+        specifier: 1.33.0
+        version: 1.33.0(react@19.1.8)
       next:
         specifier: 15.5.21
         version: 15.5.21(@types/node@22.17.0)(react-dom@19.1.8(react@19.1.8))(react@19.1.8)
@@ -1482,6 +1482,7 @@ packages:
   eslint@9.33.0:
     resolution: {integrity: sha512-TS9bTNIryDzStCpJN93aC5VRSW3uTx9sClUn4B87pwiCaJh220otoI0X8mJKr+VcPtniMdN8GKjlwgWGUv5ZKA==}
     engines: {node: ^18.18.0 || ^20.9.0 || >=21.1.0}
+    deprecated: This version is no longer supported. Please see https://eslint.org/version-support for other options.
     hasBin: true
     peerDependencies:
       jiti: '*'
@@ -1870,8 +1871,8 @@ packages:
   loupe@3.2.1:
     resolution: {integrity: sha512-CdzqowRJCeLU72bHvWqwRBBlLcMEtIvGrlvef74kMnV2AolS9Y8xUv1I0U/MNAWMhBlKIoyuEgoJ0t/bbwHbLQ==}
 
-  lucide-react@0.539.0:
-    resolution: {integrity: sha512-VVISr+VF2krO91FeuCrm1rSOLACQUYVy7NQkzrOty52Y8TlTPcXcMdQFj9bYzBgXbWCiywlwSZ3Z8u6a+6bMlg==}
+  lucide-react@1.33.0:
+    resolution: {integrity: sha512-MTRwMy0ZlL8Ur/vOAiJ9XGHE+kFPC7brq6MxAm0GiGXEBj0qy0jA/pG4N675oSzciO/UCdX8T+5yUQdmDeTLxg==}
     peerDependencies:
       react: ^16.5.1 || ^17.0.0 || ^18.0.0 || ^19.0.0
 
@@ -4246,7 +4247,7 @@ snapshots:
 
   loupe@3.2.1: {}
 
-  lucide-react@0.539.0(react@19.1.8):
+  lucide-react@1.33.0(react@19.1.8):
     dependencies:
       react: 19.1.8
 
