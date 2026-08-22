@@ -177,6 +177,27 @@ class PaperOrder(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
+class TradeIntentRecord(Base):
+    """Durable one-shot intent ledger for the future isolated execution layer.
+
+    It contains a normalized signal digest and no broker credential, account
+    secret, or opaque provider response. A unique intent ID survives restarts
+    and prevents a retried worker from treating a signal as a new order.
+    """
+
+    __tablename__ = "trade_intents"
+
+    intent_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    strategy_id: Mapped[str] = mapped_column(String(80), index=True)
+    payload_hash: Mapped[str] = mapped_column(String(128))
+    broker_client_order_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="VALIDATED", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class Invitation(Base):
     __tablename__ = "invitations"
 

@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .config import Settings, get_settings
 from .database import ActiveSession, AuditEvent, Base, SystemSetting, User, get_db, utcnow
 from .observability import measure
+from .redaction import redact
 
 
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -136,7 +137,7 @@ async def write_audit(
         result=result[:32],
         ip_hash=_client_ip_hash(request, get_settings()),
         user_agent=_safe_user_agent(request),
-        safe_metadata=safe_metadata or {},
+        safe_metadata=redact(safe_metadata or {}),
     )
     db.add(event)
     return event

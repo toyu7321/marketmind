@@ -4,7 +4,7 @@ MarketMind is an invite-only, authenticated multi-user application. Its server-s
 
 > Every private request has a verified identity, every owned record is scoped to that identity, and trading remains safety-gated.
 
-This document describes the implemented controls and the deployment work required to enable them. It is not a substitute for a professional security review before handling production brokerage credentials.
+This document describes the implemented controls and the deployment work required to enable them. It is not a substitute for a professional security review before handling production brokerage credentials. The formal threat model, response runbook, risk readiness, and future broker boundary are in [THREAT_MODEL.md](THREAT_MODEL.md), [INCIDENT_RESPONSE.md](INCIDENT_RESPONSE.md), [RISK_READINESS.md](RISK_READINESS.md), and [BROKER_SECURITY_ARCHITECTURE.md](BROKER_SECURITY_ARCHITECTURE.md).
 
 ## Identity and sessions
 
@@ -61,6 +61,10 @@ Database foreign keys, owner indexes, and per-user uniqueness constraints comple
 
 The bundled rate limiter is process-local and appropriate for a single Render/Railway instance. For multiple replicas, replace it with a shared Redis-backed limiter before horizontally scaling.
 
+## GitHub and CI/CD controls
+
+The repository includes CI that compiles/tests the backend, runs `pip-audit` and Bandit, freezes/tests/types/lints/builds the frontend, runs a production dependency audit, and performs a full-history Gitleaks scan. Dependabot monitors Python, pnpm, and GitHub Actions dependencies weekly. In the GitHub organization, enable Secret Scanning and Push Protection, protect `main` with the CI checks required before merge, restrict production-environment secrets/deployments, and review any workflow/action change as security-sensitive. GitHub settings cannot be safely enforced only by source code, so this host configuration is an operational prerequisite.
+
 ## Broker and trading safeguards
 
 Broker connections are designed for OAuth. Only a per-user opaque token-storage reference is modeled; access/refresh tokens are never written to application tables, logs, or browser storage. An OAuth initiation record stores only a one-way state hash.
@@ -74,6 +78,12 @@ Live trading is permanently locked by both settings validation and the execution
 Audit records include event type, UTC timestamp, actor user ID where known, resource, result, safe metadata, a privacy-preserving IP HMAC, and a truncated user agent. Security-relevant events include successful/failed login mapping, invitations, role changes, account enablement changes, session revocation, settings/risk changes, kill-switch actions, broker connection initiation, and paper-order denials.
 
 Avoid putting secrets, broker account identifiers, raw IPs, or raw request bodies into `safe_metadata`.
+
+## Secret rotation and logging
+
+All host secrets (Supabase service key, audit HMAC secret, database credential, Alpaca/provider keys, OAuth secret, and temporary bootstrap secret) belong in the backend host’s encrypted environment facility. They must never appear in Git, URLs, browser storage, `NEXT_PUBLIC_*`, service-worker caches, database payloads, or error details. The backend redacts common secret-bearing keys and bearer/assignment text before audit persistence and logging; callers must still never intentionally pass a secret as business metadata.
+
+For suspected exposure: activate the global kill switch, revoke/rotate the credential at its owner first, replace the Render/Vercel value, redeploy, review audit/provider activity, and invalidate affected sessions. Rotate the bootstrap secret by disabling bootstrap and deleting the value immediately after its one-time use. See the full containment steps in [INCIDENT_RESPONSE.md](INCIDENT_RESPONSE.md).
 
 ## Migration and rollback
 

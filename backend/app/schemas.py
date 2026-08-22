@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 
@@ -62,6 +62,59 @@ class RiskRequest(StrictModel):
     daily_pnl: float = Field(default=0, ge=-100_000_000, le=100_000_000)
     liquidity: float = Field(ge=0, le=10_000_000_000)
     event_risk: bool = False
+    asset_type: Literal["STOCK", "ETF", "LEVERAGED_ETF", "OPTION"] = "STOCK"
+    side: Literal["BUY", "SELL"] = "BUY"
+    strategy_id: str = Field(default="manual-preview", min_length=3, max_length=80, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+    confidence: float = Field(default=0.5, ge=0, le=1)
+    calibrated_confidence: float = Field(default=0.5, ge=0, le=1)
+    conviction_tier: Literal["NORMAL", "STRONG", "HIGH_CONVICTION", "EXCEPTIONAL"] = "NORMAL"
+    atr_percent: float = Field(default=5, gt=0, le=100)
+    stop_distance_pct: float = Field(default=5, gt=0, le=100)
+    bid_ask_spread_pct: float = Field(default=0, ge=0, le=100)
+    data_freshness: Literal["LIVE", "IEX", "DELAYED", "DEMO", "STALE", "UNAVAILABLE"] = "LIVE"
+    data_age_seconds: int = Field(default=0, ge=0, le=86_400)
+    market_status: Literal["OPEN", "CLOSED", "UNKNOWN"] = "OPEN"
+    provider_healthy: bool = True
+    data_conflict: bool = False
+    theme_exposure: float = Field(default=0, ge=0, le=100_000_000)
+    gross_exposure: float = Field(default=0, ge=0, le=100_000_000)
+    leverage: float = Field(default=1, ge=0, le=20)
+    open_positions: int = Field(default=0, ge=0, le=10_000)
+    weekly_pnl: float = Field(default=0, ge=-100_000_000, le=100_000_000)
+    peak_equity: float | None = Field(default=None, gt=0, le=100_000_000)
+    strategy_exposure: float = Field(default=0, ge=0, le=100_000_000)
+    strategy_daily_pnl: float = Field(default=0, ge=-100_000_000, le=100_000_000)
+    strategy_drawdown_pct: float = Field(default=0, ge=0, le=100)
+    buying_power: float | None = Field(default=None, ge=0, le=100_000_000)
+
+
+class TradeIntent(StrictModel):
+    """A bounded signal contract, never a broker instruction or an AI command."""
+
+    intent_id: UUID = Field(default_factory=uuid4)
+    symbol: str = Field(min_length=1, max_length=8, pattern=r"^[A-Za-z0-9]+$")
+    side: Literal["BUY", "SELL"]
+    asset_type: Literal["STOCK", "ETF", "LEVERAGED_ETF", "OPTION"] = "STOCK"
+    strategy_id: str = Field(min_length=3, max_length=80, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+    confidence: float = Field(ge=0, le=1)
+    expected_horizon: Literal["INTRADAY", "SWING", "POSITION"]
+    proposed_risk_score: float = Field(ge=0, le=100)
+    signal_timestamp: datetime
+    expires_at: datetime
+    reason_codes: list[str] = Field(min_length=1, max_length=12)
+
+    @model_validator(mode="after")
+    def bounded_and_fresh(self):
+        now = datetime.now(timezone.utc)
+        signal_time = self.signal_timestamp if self.signal_timestamp.tzinfo else self.signal_timestamp.replace(tzinfo=timezone.utc)
+        expiry = self.expires_at if self.expires_at.tzinfo else self.expires_at.replace(tzinfo=timezone.utc)
+        if expiry <= signal_time or expiry > signal_time + timedelta(minutes=30):
+            raise ValueError("trade intent expiry must be after the signal and within 30 minutes")
+        if expiry <= now or signal_time > now + timedelta(minutes=1):
+            raise ValueError("trade intent is stale or has an invalid timestamp")
+        if any(not code or len(code) > 64 or not code.replace("_", "").replace("-", "").isalnum() for code in self.reason_codes):
+            raise ValueError("trade intent reason codes must be bounded identifiers")
+        return self
 
 
 class PredictionCreate(StrictModel):
@@ -132,6 +185,25 @@ class RiskSettings(StrictModel):
     max_sector_pct: float | None = Field(default=None, ge=0.1, le=100)
     max_daily_loss_pct: float | None = Field(default=None, ge=0.1, le=100)
     min_liquidity: float | None = Field(default=None, ge=0, le=10_000_000_000)
+    max_stock_pct: float | None = Field(default=None, ge=0.1, le=100)
+    max_etf_pct: float | None = Field(default=None, ge=0.1, le=100)
+    max_leveraged_etf_pct: float | None = Field(default=None, ge=0.1, le=100)
+    max_options_pct: float | None = Field(default=None, ge=0.1, le=100)
+    max_theme_pct: float | None = Field(default=None, ge=0.1, le=100)
+    max_leverage: float | None = Field(default=None, ge=0.1, le=20)
+    max_order_notional: float | None = Field(default=None, ge=1, le=10_000_000)
+    max_open_positions: int | None = Field(default=None, ge=1, le=10_000)
+    max_weekly_loss_pct: float | None = Field(default=None, ge=0.1, le=100)
+    max_drawdown_pct: float | None = Field(default=None, ge=0.1, le=100)
+    max_risk_per_trade_pct: float | None = Field(default=None, ge=0.01, le=100)
+    max_bid_ask_spread_pct: float | None = Field(default=None, ge=0.01, le=100)
+    max_data_age_seconds: int | None = Field(default=None, ge=1, le=86_400)
+    strategy_max_allocation_pct: float | None = Field(default=None, ge=0.1, le=100)
+    strategy_daily_loss_pct: float | None = Field(default=None, ge=0.1, le=100)
+    strategy_drawdown_pct: float | None = Field(default=None, ge=0.1, le=100)
+    moderate_drawdown_pct: float | None = Field(default=None, ge=0.1, le=100)
+    severe_drawdown_pct: float | None = Field(default=None, ge=0.1, le=100)
+    live_capital_limit: float | None = Field(default=None, ge=0, le=10_000_000)
     kill_switch: bool | None = None
 
 
@@ -183,6 +255,7 @@ class PaperOrderRequest(StrictModel):
     liquidity: float = Field(default=10_000_000, ge=0, le=10_000_000_000)
     event_risk: bool = False
     confirmed: bool = False
+    intent: TradeIntent | None = None
 
     @model_validator(mode="after")
     def limit_order_has_price(self):
@@ -219,6 +292,7 @@ class UserAdminUpdate(StrictModel):
 class GlobalSecurityUpdate(StrictModel):
     global_kill_switch: bool | None = None
     risk_ceiling: RiskSettings | None = None
+    risk_policy: RiskSettings | None = None
 
 
 class SessionRevokeRequest(StrictModel):

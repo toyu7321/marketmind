@@ -1,5 +1,6 @@
 /* MarketMind worker: cache only public static assets, never authenticated screens or API data. */
-const VERSION = 'marketmind-shell-v5';
+// Bump on a cache-policy change so activation deletes every prior shell cache.
+const VERSION = 'marketmind-shell-v6';
 const SHELL = [
   '/offline', '/manifest.webmanifest',
   '/icons/marketmind.svg', '/icons/marketmind-maskable.svg',

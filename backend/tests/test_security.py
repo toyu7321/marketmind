@@ -197,6 +197,28 @@ def test_admin_endpoints_require_role_and_step_up_authentication():
         assert client.get("/api/admin/users").status_code == 200
 
 
+def test_admin_risk_policy_is_mfa_protected_capped_and_audited():
+    admin = asyncio.run(_create_user(role="ADMIN"))
+    payload = {"risk_policy": {"max_stock_pct": 100, "max_order_notional": 9_999_999, "min_liquidity": 1}}
+    with authenticated_client(_principal(admin, aal="aal1")) as client:
+        assert client.put("/api/admin/security", json=payload).status_code == 403
+    with authenticated_client(_principal(admin, aal="aal2")) as client:
+        response = client.put("/api/admin/security", json=payload)
+        assert response.status_code == 200
+        policy = response.json()["risk_policy"]
+        assert policy["max_stock_pct"] == 15
+        assert policy["max_order_notional"] == 50_000
+        assert policy["min_liquidity"] == 500_000
+
+    async def audit_event():
+        async with Session() as db:
+            return (await db.execute(select(AuditEvent).where(AuditEvent.user_id == admin.id, AuditEvent.event_type == "GLOBAL_SECURITY_CHANGED"))).scalar_one_or_none()
+
+    event = asyncio.run(audit_event())
+    assert event is not None
+    assert event.safe_metadata["risk_policy_changed"] is True
+
+
 def test_sensitive_paper_order_remains_locked_and_audited():
     user = asyncio.run(_create_user())
 

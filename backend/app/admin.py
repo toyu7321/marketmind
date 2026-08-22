@@ -13,6 +13,7 @@ from .config import get_settings
 from .database import ActiveSession, AuditEvent, BrokerConnection, Invitation, SystemSetting, User, get_db, utcnow
 from .schemas import BootstrapAdminRequest, GlobalSecurityUpdate, InviteUserRequest, UserAdminUpdate
 from .security import Principal, client_rate_limit_subject, rate_limiter, require_admin, write_audit
+from .risk import RISK_POLICY_VERSION, RiskLimits
 
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -29,6 +30,12 @@ def user_view(user: User) -> dict[str, Any]:
         "created_at": user.created_at.isoformat(),
         "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None,
     }
+
+
+def _risk_policy_view(values: dict[str, Any] | None) -> dict[str, Any]:
+    policy = RiskLimits.from_mapping(values).as_safe_dict()
+    policy.pop("policy_version", None)
+    return policy
 
 
 async def _supabase_invite(payload: InviteUserRequest) -> dict[str, Any]:
@@ -231,7 +238,9 @@ async def audit_log(limit: int = 100, _: Principal = Depends(require_admin), db:
 @router.get("/security")
 async def global_security(_: Principal = Depends(require_admin), db: AsyncSession = Depends(get_db)):
     row = await db.get(SystemSetting, "security")
-    return {"global_kill_switch": bool(row and row.value.get("global_kill_switch")), "risk_ceiling": (row.value.get("risk_ceiling", {}) if row else {})}
+    raw_policy = (row.value.get("risk_policy") or row.value.get("risk_ceiling") or {}) if row else {}
+    policy = _risk_policy_view(raw_policy)
+    return {"global_kill_switch": bool(row and row.value.get("global_kill_switch")), "risk_policy": policy, "risk_ceiling": policy, "risk_policy_version": RISK_POLICY_VERSION}
 
 
 @router.put("/security")
@@ -239,18 +248,28 @@ async def update_global_security(payload: GlobalSecurityUpdate, request: Request
     row = await db.get(SystemSetting, "security")
     current = dict(row.value) if row else {}
     update = payload.model_dump(exclude_none=True)
-    if "risk_ceiling" in update:
-        update["risk_ceiling"] = {key: value for key, value in update["risk_ceiling"].items() if value is not None}
+    requested_policy = update.pop("risk_policy", None) or update.pop("risk_ceiling", None)
+    previous_policy = dict(current.get("risk_policy") or current.get("risk_ceiling") or {})
+    if requested_policy is not None:
+        # Rebuild through the immutable code-level ceilings before persistence.
+        update["risk_policy"] = _risk_policy_view({key: value for key, value in requested_policy.items() if value is not None})
+        current.pop("risk_ceiling", None)
     current.update(update)
     if row is None:
         row = SystemSetting(key="security", value=current, updated_by_user_id=principal.user.id)
         db.add(row)
     else:
         row.value, row.updated_by_user_id = current, principal.user.id
-    event = "GLOBAL_KILL_SWITCH_TRIGGERED" if update.get("global_kill_switch") else "GLOBAL_SECURITY_CHANGED"
-    await write_audit(db, request, event_type=event, user_id=principal.user.id, resource="system/security", safe_metadata={"global_kill_switch": current.get("global_kill_switch", False)})
+    if update.get("global_kill_switch") is True:
+        event = "GLOBAL_KILL_SWITCH_TRIGGERED"
+    elif update.get("global_kill_switch") is False:
+        event = "GLOBAL_KILL_SWITCH_RELEASED"
+    else:
+        event = "GLOBAL_SECURITY_CHANGED"
+    await write_audit(db, request, event_type=event, user_id=principal.user.id, resource="system/security", safe_metadata={"global_kill_switch": current.get("global_kill_switch", False), "risk_policy_changed": requested_policy is not None, "risk_policy_previous": previous_policy if requested_policy is not None else None, "risk_policy_new": current.get("risk_policy") if requested_policy is not None else None, "risk_policy_version": RISK_POLICY_VERSION})
     await db.commit()
-    return {"global_kill_switch": bool(current.get("global_kill_switch")), "risk_ceiling": current.get("risk_ceiling", {})}
+    policy = _risk_policy_view(current.get("risk_policy"))
+    return {"global_kill_switch": bool(current.get("global_kill_switch")), "risk_policy": policy, "risk_ceiling": policy, "risk_policy_version": RISK_POLICY_VERSION}
 
 
 @router.get("/broker-connections")

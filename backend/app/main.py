@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import math
 import time
@@ -20,7 +21,7 @@ from .admin import router as admin_router
 from .backtesting import run_backtest
 from .config import get_settings
 from .database import (
-    BacktestRun, BrokerConnection, PaperOrder, Portfolio, PortfolioPosition, Prediction, SavedStrategy,
+    BacktestRun, BrokerConnection, PaperOrder, Portfolio, PortfolioPosition, Prediction, SavedStrategy, TradeIntentRecord,
     SystemSetting, UserPreference, UserRiskProfile, UserSetting, get_db, init_db, utcnow,
 )
 from .indicators import technical_snapshot
@@ -29,7 +30,8 @@ from .providers import (
     EdgarSECProvider, analyze_evidence, close_provider_clients, market_provider, news_provider,
     options_provider, public_market_cache_report, start_provider_clients, strategy_candidates,
 )
-from .risk import RiskLimits, evaluate
+from .risk import RISK_POLICY_VERSION, RiskLimits, evaluate
+from .redaction import install_secret_redaction
 from .schemas import BacktestRequest, PaperOrderRequest, PortfolioResponse, PredictionCreate, RiskRequest, SettingsUpdate
 from .scoring import MARKET_WEIGHTS, STOCK_WEIGHTS, score
 from .security import (
@@ -40,6 +42,7 @@ from .security import (
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    install_secret_redaction()
     await init_db()
     await start_provider_clients()
     try:
@@ -107,10 +110,7 @@ DEFAULT_USER_SETTINGS: dict[str, Any] = {
     "watchlist": ["SPY", "QQQ", "NVDA", "AMD", "AAPL", "MSFT", "META", "AMZN", "GOOGL", "TSLA"],
     "market_weights": MARKET_WEIGHTS,
     "stock_weights": STOCK_WEIGHTS,
-    "risk": {
-        "max_position_pct": 10, "max_exposure_pct": 80, "max_sector_pct": 30,
-        "max_daily_loss_pct": 3, "min_liquidity": 1_000_000, "kill_switch": False,
-    },
+    "risk": {key: value for key, value in RiskLimits().as_safe_dict().items() if key != "policy_version"},
     "automation": {"premarket": True, "session": True, "postmarket": True},
     "ai": {"model": settings.openai_model, "mode": "Top 5 only"},
 }
@@ -160,15 +160,29 @@ async def runtime_settings(db: AsyncSession, user_id: str) -> dict[str, Any]:
 
 
 async def effective_risk_limits(db: AsyncSession, principal: Principal, config: dict[str, Any]) -> RiskLimits:
+    """Return a policy that user preferences may tighten, never widen.
+
+    ``config`` deliberately is not used as a source of permissive limits: it
+    includes user-editable display preferences. The only authority that can
+    alter deployment-wide limits is the AAL2-protected administrator setting.
+    """
     profile = await db.get(UserRiskProfile, principal.user.id)
-    limits = _merge(config["risk"], profile.limits if profile else None)
     system_security = await db.get(SystemSetting, "security")
-    ceilings = (system_security.value.get("risk_ceiling") if system_security else {}) or {}
-    for key, ceiling in ceilings.items():
-        if ceiling is not None and key in limits and isinstance(limits[key], (int, float)):
-            limits[key] = min(limits[key], ceiling)
-    limits["kill_switch"] = bool(limits.get("kill_switch")) or principal.user.kill_switch_enabled or bool(system_security and system_security.value.get("global_kill_switch"))
-    return RiskLimits(**limits)
+    admin_policy = ((system_security.value.get("risk_policy") or system_security.value.get("risk_ceiling")) if system_security else {}) or {}
+    policy = RiskLimits.from_mapping(admin_policy)
+    user_limits = (profile.limits if profile else {}) or {}
+    tightened = policy.as_safe_dict()
+    for key, value in user_limits.items():
+        if value is None or key not in tightened:
+            continue
+        if key == "min_liquidity":
+            tightened[key] = max(float(tightened[key]), float(value))
+        elif key == "kill_switch":
+            tightened[key] = bool(tightened[key]) or bool(value)
+        elif isinstance(tightened[key], (int, float)) and isinstance(value, (int, float)):
+            tightened[key] = min(float(tightened[key]), float(value))
+    tightened["kill_switch"] = bool(tightened.get("kill_switch")) or principal.user.kill_switch_enabled or bool(system_security and system_security.value.get("global_kill_switch"))
+    return RiskLimits.from_mapping(tightened)
 
 
 def _mode(*items: Any) -> str:
@@ -576,7 +590,13 @@ async def paper_order_detail(order_id: str, principal: Principal = Depends(requi
 
 
 def _order_risk_request(order: PaperOrderRequest, equity: float) -> RiskRequest:
-    return RiskRequest(symbol=order.symbol.upper(), proposed_value=order.quantity * (order.limit_price or order.estimated_price), portfolio_equity=equity, current_exposure=order.current_exposure, sector_exposure=order.sector_exposure, daily_pnl=order.daily_pnl, liquidity=order.liquidity, event_risk=order.event_risk)
+    intent = order.intent
+    return RiskRequest(
+        symbol=order.symbol.upper(), proposed_value=order.quantity * (order.limit_price or order.estimated_price), portfolio_equity=equity,
+        current_exposure=order.current_exposure, sector_exposure=order.sector_exposure, daily_pnl=order.daily_pnl,
+        liquidity=order.liquidity, event_risk=order.event_risk, asset_type=intent.asset_type if intent else "STOCK",
+        side=order.side, strategy_id=intent.strategy_id if intent else "manual-preview", confidence=intent.confidence if intent else .5,
+    )
 
 
 @app.post("/api/trading/preview", dependencies=[Depends(rate_limit("order_preview", 10))])
@@ -584,7 +604,7 @@ async def preview_paper_order(order: PaperOrderRequest, principal: Principal = D
     config = await runtime_settings(db, principal.user.id)
     portfolio_row = await _personal_portfolio(db, principal.user.id)
     decision = evaluate(_order_risk_request(order, portfolio_row.cash), await effective_risk_limits(db, principal, config))
-    return {"mode": "PAPER", "order": order.model_dump(exclude={"confirmed"}), "risk": decision, "requires_confirmation": decision["decision"] == "APPROVED", "execution": "disabled until a user-owned OAuth broker connection is activated"}
+    return {"mode": "PAPER", "order": order.model_dump(exclude={"confirmed"}), "risk": decision, "requires_confirmation": False, "execution": "disabled by the security freeze; no broker order can be created", "risk_policy_version": RISK_POLICY_VERSION}
 
 
 @app.post("/api/trading/orders", dependencies=[Depends(rate_limit("order_submit", 5))])
@@ -592,12 +612,33 @@ async def submit_paper_order(order: PaperOrderRequest, request: Request, idempot
     await trading_allowed(db, principal)
     if not order.confirmed:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Explicit confirmation is required before a paper order is submitted.")
+    if order.intent is None:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="A current, structured trade intent is required for order submission.")
+    if order.intent.symbol.upper() != order.symbol.upper() or order.intent.side != order.side:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Trade intent does not match the proposed order.")
+    payload = order.model_dump(mode="json")
+    preview_hash = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     existing = (await db.execute(select(PaperOrder).where(PaperOrder.user_id == principal.user.id, PaperOrder.idempotency_key == idempotency_key))).scalar_one_or_none()
     if existing:
+        if not hmac.compare_digest(existing.preview_hash, preview_hash):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Idempotency key was already used for a different order.")
         return {"id": existing.id, "status": existing.status, "idempotent_replay": True}
+    existing_intent = await db.get(TradeIntentRecord, str(order.intent.intent_id))
+    if existing_intent is not None:
+        await write_audit(db, request, event_type="TRADE_INTENT_REPLAY_REJECTED", user_id=principal.user.id, resource="trading/orders", result="DENIED", safe_metadata={"intent_id": str(order.intent.intent_id)})
+        await db.commit()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Trade intent was already consumed or rejected.")
+    config = await runtime_settings(db, principal.user.id)
+    portfolio_row = await _personal_portfolio(db, principal.user.id)
+    decision = evaluate(_order_risk_request(order, portfolio_row.cash), await effective_risk_limits(db, principal, config))
+    client_order_id = f"mm-{str(order.intent.intent_id).replace('-', '')[:24]}"
+    intent_record = TradeIntentRecord(intent_id=str(order.intent.intent_id), user_id=principal.user.id, strategy_id=order.intent.strategy_id, payload_hash=preview_hash, broker_client_order_id=client_order_id, expires_at=order.intent.expires_at, status="REJECTED" if decision["decision"] == "REJECTED" else "VALIDATED")
+    db.add(intent_record)
+    if decision["decision"] == "REJECTED":
+        await write_audit(db, request, event_type="TRADE_INTENT_REJECTED", user_id=principal.user.id, resource="trading/orders", result="DENIED", safe_metadata={"intent_id": str(order.intent.intent_id), "policy_version": decision["policy_version"], "reason_count": len(decision["reasons"])})
+        await db.commit()
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="The deterministic risk policy rejected this trade intent.")
     connection = (await db.execute(select(BrokerConnection).where(BrokerConnection.user_id == principal.user.id, BrokerConnection.provider == "alpaca", BrokerConnection.environment == "paper", BrokerConnection.status == "ACTIVE"))).scalar_one_or_none()
-    payload = order.model_dump()
-    preview_hash = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
     if connection is None:
         row = PaperOrder(user_id=principal.user.id, idempotency_key=idempotency_key, payload=payload, preview_hash=preview_hash, status="REJECTED")
         db.add(row)
@@ -626,7 +667,8 @@ async def get_settings_endpoint(principal: Principal = Depends(require_authentic
         "OpenAI": "Connected" if settings.openai_enabled else "Offline (rules fallback)", "SEC": "Configured" if settings.sec_is_configured else "Available",
         "Broker": "Not connected", "Paper order submission": "Disabled until OAuth connection activation", "Live Trading": "Locked",
     }
-    return {**config, "providers": providers, "provider_status": {**market_status, **news_status, **options_status}, "security": {"global_kill_switch": bool(security and security.value.get("global_kill_switch")), "user_kill_switch": principal.user.kill_switch_enabled, "mfa_level": principal.aal}}
+    effective_limits = await effective_risk_limits(db, principal, config)
+    return {**config, "providers": providers, "provider_status": {**market_status, **news_status, **options_status}, "security": {"global_kill_switch": bool(security and security.value.get("global_kill_switch")), "user_kill_switch": principal.user.kill_switch_enabled, "mfa_level": principal.aal, "risk_policy_version": RISK_POLICY_VERSION, "effective_risk_limits": effective_limits.as_safe_dict()}}
 
 
 @app.put("/api/settings", dependencies=[Depends(rate_limit("settings", 20))])
@@ -655,6 +697,6 @@ async def update_settings(payload: SettingsUpdate, request: Request, principal: 
     if "risk" in update and "kill_switch" in update["risk"]:
         principal.user.kill_switch_enabled = bool(update["risk"]["kill_switch"])
         await write_audit(db, request, event_type="KILL_SWITCH_TRIGGERED" if principal.user.kill_switch_enabled else "KILL_SWITCH_RELEASED", user_id=principal.user.id, resource="settings/risk")
-    await write_audit(db, request, event_type="RISK_SETTING_CHANGED" if "risk" in update else "SETTINGS_CHANGED", user_id=principal.user.id, resource="settings", safe_metadata={"sections": sorted(update)})
+    await write_audit(db, request, event_type="RISK_SETTING_CHANGED" if "risk" in update else "SETTINGS_CHANGED", user_id=principal.user.id, resource="settings", safe_metadata={"sections": sorted(update), "risk_keys": sorted(update.get("risk", {})), "risk_policy_version": RISK_POLICY_VERSION})
     await db.commit()
     return {"status": "saved", "settings": merged}

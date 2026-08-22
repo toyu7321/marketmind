@@ -15,7 +15,7 @@ function secureHeaders(response: NextResponse, request: NextRequest, privateResp
   response.headers.set('X-Frame-Options', 'DENY');
   response.headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
   response.headers.set('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=()');
-  if (request.nextUrl.protocol === 'https:') response.headers.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  if (request.nextUrl.protocol === 'https:' || request.headers.get('x-forwarded-proto') === 'https') response.headers.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
   if (privateResponse) response.headers.set('Cache-Control', 'no-store, private, max-age=0');
   return response;
 }

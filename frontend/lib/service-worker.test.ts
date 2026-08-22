@@ -20,6 +20,12 @@ function eventFor(path:string): FetchEvent {
 }
 
 describe('PWA static cache policy', () => {
+  it('rotates the static shell cache and purges older cache versions on activation', () => {
+    const source = readFileSync(fileURLToPath(new URL('../public/sw.js', import.meta.url)), 'utf8');
+    expect(source).toContain("marketmind-shell-v6");
+    expect(source).toContain("keys.filter(key => key !== VERSION).map(key => caches.delete(key))");
+  });
+
   it('never intercepts or caches authenticated API responses', () => {
     const fetch = vi.fn(); const {listener, caches} = fetchListener({fetch}); const event = eventFor('/api/portfolio');
     listener(event);
