@@ -8,12 +8,63 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import get_settings
-from .database import ActiveSession, BrokerConnection, get_db, utcnow
+from .database import ActiveSession, BrokerConnection, Invitation, get_db, utcnow
 from .schemas import SessionRevokeRequest
 from .security import Principal, get_owned_resource, require_authenticated_user, require_sensitive_action_auth, write_audit
 
 
 router = APIRouter(prefix="/api", tags=["account"])
+
+
+async def _mapped_invitation(principal: Principal, db: AsyncSession) -> Invitation:
+    """Return the one invitation bound to this verified provider identity."""
+    if not principal.user.is_active:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invitation identity could not be verified.")
+    provider_email = str(principal.claims.get("email") or "").strip().lower()
+    if not provider_email or provider_email != principal.user.email.strip().lower():
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invitation identity could not be verified.")
+    invitation = (await db.execute(select(Invitation).where(
+        Invitation.invited_user_id == principal.user.id,
+    ))).scalar_one_or_none()
+    if invitation is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invitation onboarding is not available for this account.")
+    if (
+        invitation.email.strip().lower() != provider_email
+        or invitation.role != principal.user.role
+        or (invitation.provider_invitation_id and invitation.provider_invitation_id != principal.subject)
+    ):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Invitation mapping could not be verified.")
+    return invitation
+
+
+@router.get("/account/onboarding")
+async def invitation_onboarding(principal: Principal = Depends(require_authenticated_user), db: AsyncSession = Depends(get_db)):
+    invitation = await _mapped_invitation(principal, db)
+    if invitation.status not in {"PENDING", "ACCEPTED"}:
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail="Invitation is no longer available.")
+    return {
+        "status": invitation.status.lower(),
+        "email": principal.user.email,
+        "role": principal.user.role,
+        "active": principal.user.is_active,
+    }
+
+
+@router.post("/account/onboarding/accept")
+async def accept_invitation(request: Request, principal: Principal = Depends(require_authenticated_user), db: AsyncSession = Depends(get_db)):
+    invitation = await _mapped_invitation(principal, db)
+    if invitation.status == "ACCEPTED":
+        return {"status": "already_accepted"}
+    if invitation.status != "PENDING":
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail="Invitation is no longer available.")
+    now = utcnow()
+    invitation.status = "ACCEPTED"
+    invitation.accepted_at = now
+    principal.user.email_verified = True
+    principal.user.last_login_at = now
+    await write_audit(db, request, event_type="INVITATION_ACCEPTED", user_id=principal.user.id, resource=f"users/{principal.user.id}")
+    await db.commit()
+    return {"status": "accepted"}
 
 
 @router.get("/account")

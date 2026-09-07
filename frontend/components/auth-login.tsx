@@ -1,10 +1,11 @@
 'use client';
 
-import {FormEvent, useState} from 'react';
+import {FormEvent, useEffect, useState} from 'react';
 import {useRouter, useSearchParams} from 'next/navigation';
 import {ArrowRight, LockKeyhole, ShieldCheck} from 'lucide-react';
 import {clearClientDataCache} from '@/lib/data';
-import {authConfigured, createSupabaseBrowserClient} from '@/lib/supabase/client';
+import {ApiError, api} from '@/lib/api';
+import {authConfigured, consumeInvitationOrGetUser, createSupabaseBrowserClient} from '@/lib/supabase/client';
 
 export function AuthLogin() {
   const router = useRouter();
@@ -15,13 +16,46 @@ export function AuthLogin() {
   const [message, setMessage] = useState('');
   const configured = authConfigured();
 
+  async function continueAfterAuthentication() {
+    void clearClientDataCache();
+    try {
+      const onboarding = await api<{status: 'pending'|'accepted'}>('/account/onboarding');
+      if (onboarding.status === 'pending') {
+        router.replace('/auth/accept-invite?resume=1');
+        return;
+      }
+    } catch (error) {
+      // Accounts created before invitation tracking (including the bootstrap
+      // administrator) correctly have no onboarding record.
+      if (!(error instanceof ApiError && error.status === 404)) throw error;
+    }
+    const next = search.get('next');
+    router.replace(next?.startsWith('/') && !next.startsWith('//') ? next : '/');
+  }
+
+  useEffect(() => {
+    if (!configured) return;
+    let active = true;
+    void (async () => {
+      const result = await consumeInvitationOrGetUser();
+      if (!active || result.error || !result.user) return;
+      try { await continueAfterAuthentication(); } catch { if (active) setMessage('Your session could not be prepared. Please try again.'); }
+    })();
+    return () => { active = false; };
+  // The router and search object are stable for this mounted login screen.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [configured]);
+
   async function signIn(event: FormEvent) {
     event.preventDefault();
     if (!configured || busy) return;
     setBusy(true); setMessage('');
     const {error} = await createSupabaseBrowserClient().auth.signInWithPassword({email, password});
     if (error) setMessage('Unable to sign in. Check your credentials or invitation status.');
-    else { void clearClientDataCache(); router.replace(search.get('next')?.startsWith('/') ? search.get('next')! : '/'); }
+    else {
+      try { await continueAfterAuthentication(); }
+      catch { setMessage('Signed in, but account setup could not be checked. Please try again.'); }
+    }
     setBusy(false);
   }
 

@@ -23,6 +23,13 @@ The service worker never caches navigation responses, API responses, cookies, se
 The `users` table has a random UUID primary key plus a unique provider `auth_subject`, email, active flag, and `ADMIN` or `USER` role. Roles are enforced by FastAPI dependencies, never trusted from browser UI state or user-editable metadata.
 
 - Sign-up is disabled in the provider configuration. Administrators send invitations from the Admin Console using the Supabase server secret, which remains backend-only.
+- Each server-issued invitation redirects explicitly to `/auth/accept-invite`.
+  This public route is only a callback surface: it consumes Supabase's
+  one-time invitation session in the browser, requires the invitee to choose a
+  strong password, and asks FastAPI to verify the existing subject/email/role
+  mapping. It never creates a MarketMind user. Pending invitees are denied by
+  every other private API until that mapping is finalized; completed or
+  mismatched invitations fail closed.
 - Administrator endpoints require both `ADMIN` and Supabase `aal2` (TOTP step-up) by default.
 - Broker connection setup, remote-paper submission, and revocation of other sessions require `aal2` for all roles.
 - The Security page supports TOTP enrollment and verification. Passkeys/WebAuthn are deliberately a future additive factor rather than a substitute for the working TOTP path.

@@ -43,7 +43,11 @@ async def _supabase_invite(payload: InviteUserRequest) -> dict[str, Any]:
     settings = get_settings()
     if not settings.auth_ready or not settings.supabase_secret_key:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Invitation service is not configured.")
-    redirect_to = f"{settings.frontend_origin.rstrip('/')}/auth/callback" if settings.frontend_origin else None
+    # Supabase admin invitations use an implicit invitation session (PKCE is
+    # intentionally unsupported because the accepting browser differs from the
+    # administrator's browser). Land directly on the public, client-side
+    # consumer so the URL fragment can be exchanged for cookie-backed auth.
+    redirect_to = f"{settings.frontend_origin.rstrip('/')}/auth/accept-invite" if settings.frontend_origin else None
     body: dict[str, Any] = {"email": str(payload.email), "data": {"display_name": payload.display_name, "marketmind_role": payload.role}}
     if redirect_to:
         body["redirect_to"] = redirect_to

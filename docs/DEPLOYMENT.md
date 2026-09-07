@@ -20,13 +20,23 @@ The frontend is a private application, not a public demo site. Configure identit
 4. In **URL Configuration**, set the Site URL to your Vercel URL and add each callback URL, for example:
 
    ```text
+   https://marketmind-xxxx.vercel.app/auth/accept-invite
    https://marketmind-xxxx.vercel.app/auth/callback
+   https://marketmind.example.com/auth/accept-invite
    https://marketmind.example.com/auth/callback
    ```
 
-5. In **Multi-Factor Authentication**, enable TOTP. Administrators must enroll it before any administrator operation is accepted.
-6. In **JWT signing keys**, use an asymmetric ECC/RSA signing key compatible with the backend’s `ES256,RS256` allowlist. Do not add an `HS256` shared secret as a compatibility shortcut.
-7. Invite or create the very first administrator in the Supabase dashboard. Copy that user’s UUID from the Auth users page. Do not create a public password-signup flow.
+   The production invite redirect must be an exact allowed URL. Supabase
+   silently falls back to the Site URL when an invitation redirect is not
+   allowlisted, bypassing MarketMind's password-creation screen. Keep the Site
+   URL at the canonical application origin.
+5. In **Email Templates → Invite user**, keep the accept button pointed at
+   `{{ .ConfirmationURL }}`. Supabase then verifies the one-time invitation
+   before returning its temporary session to `/auth/accept-invite`. Do not
+   replace this with a direct Site URL or put its token in application logs.
+6. In **Multi-Factor Authentication**, enable TOTP. Administrators must enroll it before any administrator operation is accepted.
+7. In **JWT signing keys**, use an asymmetric ECC/RSA signing key compatible with the backend’s `ES256,RS256` allowlist. Do not add an `HS256` shared secret as a compatibility shortcut.
+8. Invite or create the very first administrator in the Supabase dashboard. Copy that user’s UUID from the Auth users page. Do not create a public password-signup flow.
 
 Supabase publishes its [Auth overview](https://supabase.com/docs/guides/auth), [server-side Next.js guidance](https://supabase.com/docs/guides/auth/server-side/creating-a-client), and [MFA/TOTP setup](https://supabase.com/docs/guides/auth/auth-mfa).
 
@@ -145,7 +155,12 @@ The frontend will intentionally send an unauthenticated visitor to `/login`. A m
 2. Sign in with the bootstrap account. Confirm dashboard data loads only after authentication.
 3. Visit **Security**, enroll and verify a TOTP authenticator, then confirm `aal2` access is shown.
 4. Visit **Admin Console** and confirm that non-admin or non-MFA sessions receive no user/audit data.
-5. Invite a standard user and confirm the user can see only their own settings, predictions, portfolio, broker connections, backtests, strategies, orders, and sessions.
+5. Invite a standard user. Confirm the link opens `/auth/accept-invite`, shows
+   the non-editable invited email, requires a strong user-chosen password,
+   finalizes the existing MarketMind user mapping, and then opens Dashboard.
+   An unauthenticated direct visit to the acceptance page must fail safely.
+   Confirm the activated user can see only their own settings, predictions,
+   portfolio, broker connections, backtests, strategies, orders, and sessions.
 6. Enable the global kill switch as an MFA-enabled administrator. Confirm every paper order attempt is rejected. Release it only after deliberate confirmation.
 7. Confirm `/api/health` exposes no token, database URL, provider secret, or raw audit data.
 8. Use browser developer tools to verify `/api/*` responses have `Cache-Control: no-store`; go offline and confirm the PWA does not display stale account/market API content.

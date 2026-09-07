@@ -18,7 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import Settings, get_settings
-from .database import ActiveSession, AuditEvent, Base, SystemSetting, TradingControlState, TradingHold, User, get_db, utcnow
+from .database import ActiveSession, AuditEvent, Base, Invitation, SystemSetting, TradingControlState, TradingHold, User, get_db, utcnow
 from .observability import measure
 from .redaction import redact
 
@@ -337,8 +337,19 @@ async def require_authenticated_user(
             session_id=session_id,
             claims=claims,
         )
+        pending_invitation = (await db.execute(select(Invitation.id).where(
+            Invitation.invited_user_id == user.id,
+            Invitation.status == "PENDING",
+        ).limit(1))).scalar_one_or_none()
+        onboarding_request = request.url.path.startswith("/api/account/onboarding")
+        if pending_invitation and not onboarding_request:
+            # The Supabase invite session proves control of the invited email,
+            # but the account is not usable until the invitee chooses a password
+            # and the application mapping is finalized.
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account activation is required.")
         if session is None or await session_activity_gate.should_touch(principal.user.id, principal.session_id):
-            user.last_login_at = utcnow()
+            if not pending_invitation:
+                user.last_login_at = utcnow()
             with measure("database.auth_session"):
                 await _record_session(db, request, principal)
                 await db.commit()

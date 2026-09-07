@@ -1,7 +1,7 @@
 import {createServerClient} from '@supabase/ssr';
 import {NextRequest, NextResponse} from 'next/server';
 
-const publicPaths = new Set(['/login', '/offline', '/manifest.webmanifest', '/sw.js']);
+const publicPaths = new Set(['/login', '/auth/callback', '/auth/accept-invite', '/offline', '/manifest.webmanifest', '/sw.js']);
 
 function configured() {
   return Boolean(process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY);
